@@ -1,0 +1,39 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+.eggs/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+node_modules/
+.DS_Store
+*.log
+
+# Local runtime state: the browser profile holds a live LinkedIn session
+# cookie, and memory.json holds personal candidate data. Never commit these.
+data/
+
+# The profile belongs in data/, but someone following profile.example.md by hand
+# may drop a copy at the root instead. Catch that too -- it holds a name, a
+# phone number and a resume path.
+/profile.md
+
+# Per-session notes written by whatever harness is driving this repo. They are
+# working scratch -- they contain the candidate's own facts, including the
+# answers to visa and salary questions -- and they are not part of the project.
+# `data/` is ignored for the same reason; this directory sits outside it, which
+# is why it needs its own line rather than being covered by that one.
+.workbuddy/
+
+# Working notes from building this project: product specs, milestone tickets,
+# audit reports and decision records. Kept here so the published tree stays
+# readable, and ignored because they are written for the author rather than for
+# someone using the tool.
+.notes/

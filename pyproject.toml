@@ -1,0 +1,54 @@
+[project]
+name = "applyops-agent"
+version = "0.1.0"
+description = "Harness-agnostic auto-apply: browser hands + a learning memory, exposed as an MCP server"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "hanyuli0310", email = "hanyuli0310@users.noreply.github.com" }]
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Typing :: Typed",
+]
+# Deliberately small. The project drives a browser and remembers answers; it does
+# not call a model, and it has no UI of its own -- the MCP client is the front end.
+# That is what removed the API-key requirement and the provider-drift problem.
+dependencies = [
+    "playwright>=1.49.0",
+    "pydantic>=2.10.0",
+    "mcp>=2.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+applyops-mcp = "applyops.mcp.server:main"
+applyops-init = "applyops.cli:init_main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/applyops"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ApplyOps — Job Application Agent</title>
+    
+    <!-- Modern Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app-wrapper">
+        <!-- App Header -->
+        <header class="navbar">
+            <div class="nav-brand">
+                <div class="brand-logo">
+                    <span class="logo-icon">⚡</span>
+                </div>
+                <div class="brand-text">
+                    <h1>ApplyOps <span class="badge-tag">AI Agent</span></h1>
+                    <p class="brand-desc">Computer Use &amp; Guided Memory Automation</p>
+                </div>
+            </div>
+
+            <div class="nav-actions">
+                <div class="status-pill" id="conn-pill">
+                    <span class="status-dot disconnected" id="conn-dot"></span>
+                    <span class="status-label" id="conn-text">Connecting...</span>
+                </div>
+                <button class="nav-btn" id="settings-btn" title="Settings">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                    </svg>
+                    <span>Config</span>
+                </button>
+            </div>
+        </header>
+
+        <!-- Main Container -->
+        <main class="main-content">
+            <!-- Left Column: Primary Execution Area -->
+            <div class="panel-left">
+                <!-- Target Input Box -->
+                <div class="glass-card url-bar-card">
+                    <div class="url-input-wrapper">
+                        <div class="url-icon">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <line x1="2" y1="12" x2="22" y2="12"></line>
+                                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+                            </svg>
+                        </div>
+                        <input type="url" id="job-url" placeholder="Paste LinkedIn or Indeed job link here..." autocomplete="off" spellcheck="false">
+                        <button class="icon-action-btn" id="paste-btn" title="Paste from clipboard">
+                            📋 Paste
+                        </button>
+                        <button class="glow-btn" id="apply-btn">
+                            <span class="btn-spinner hidden" id="apply-spinner"></span>
+                            <span class="btn-label" id="apply-btn-label">Launch Agent</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Live Browser Canvas & Controls -->
+                <div class="glass-card viewport-card">
+                    <div class="card-header">
+                        <div class="header-status">
+                            <span class="pulse-indicator" id="agent-pulse"></span>
+                            <span class="agent-state-label" id="agent-state-text">Agent Idle</span>
+                        </div>
+                        <div class="header-actions">
+                            <button class="stop-btn hidden" id="stop-btn">
+                                ⏹ Stop Agent
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="browser-viewport" id="viewport-box">
+                        <div class="viewport-placeholder" id="viewport-empty">
+                            <div class="empty-icon">🌐</div>
+                            <h3>Browser Viewport Standby</h3>
+                            <p>Enter a job posting URL above to watch ApplyOps navigate, parse forms, and submit your application in real time.</p>
+                        </div>
+                        <img id="viewport-img" class="viewport-img hidden" alt="Agent Live View">
+
+                        <!-- Interactive Question Prompt Bubble -->
+                        <div class="overlay-modal hidden" id="ask-modal">
+                            <div class="modal-card prompt-card">
+                                <div class="prompt-badge">🧠 Agent Clarification Required</div>
+                                <h3 id="ask-question-text">Question from application form</h3>
+                                <p class="prompt-context" id="ask-context-text">Context details</p>
+                                <div class="memory-suggestion hidden" id="ask-suggestion-box">
+                                    <div class="suggestion-head">
+                                        <span>💾 I remember roughly…</span>
+                                        <span class="conf-chip" id="ask-suggestion-conf">0.00</span>
+                                    </div>
+                                    <div class="suggestion-body" id="ask-suggestion-text"></div>
+                                    <button type="button" class="mini-btn" id="ask-use-suggestion-btn">Use this</button>
+                                </div>
+                                <div class="prompt-input-row">
+                                    <input type="text" id="ask-answer-input" placeholder="Type your answer here..." autocomplete="off">
+                                    <button class="glow-btn" id="ask-submit-btn">Answer &amp; Remember</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Manual Action / CAPTCHA Prompt -->
+                        <div class="overlay-modal hidden" id="wait-modal">
+                            <div class="modal-card warning-card">
+                                <div class="warning-badge">⚠️ Human Action Required</div>
+                                <h3>Security verification or manual step</h3>
+                                <p id="wait-message-text">Please handle the CAPTCHA, 2FA, or login in the browser window, then click Continue.</p>
+                                <button class="glow-btn btn-warning" id="wait-resume-btn">Continue Application</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Step Log / Status Feed -->
+                    <div class="action-footer">
+                        <span class="footer-icon">⚡</span>
+                        <div class="action-feed-text" id="action-status-feed">Ready to begin.</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Column: Memory & History Sidepanel -->
+            <div class="panel-right">
+                <!-- Flywheel Health -->
+                <div class="glass-card side-card flywheel-card">
+                    <div class="card-header border-bottom">
+                        <h3>🔄 Memory Flywheel</h3>
+                        <span class="sub-count" id="flywheel-rate">0% automated</span>
+                    </div>
+                    <div class="flywheel-body">
+                        <div class="flywheel-ring">
+                            <svg viewBox="0 0 120 120" class="ring-svg">
+                                <circle class="ring-track" cx="60" cy="60" r="52"></circle>
+                                <circle class="ring-value" id="ring-arc" cx="60" cy="60" r="52"></circle>
+                            </svg>
+                            <div class="ring-label">
+                                <span class="ring-pct" id="ring-pct">0%</span>
+                                <span class="ring-sub">auto-answered</span>
+                            </div>
+                        </div>
+                        <div class="flywheel-metrics">
+                            <div class="metric">
+                                <span class="metric-val" id="m-memories">0</span>
+                                <span class="metric-key">memories</span>
+                            </div>
+                            <div class="metric">
+                                <span class="metric-val" id="m-autoready">0</span>
+                                <span class="metric-key">trusted</span>
+                            </div>
+                            <div class="metric">
+                                <span class="metric-val" id="m-asked">0</span>
+                                <span class="metric-key">asked you</span>
+                            </div>
+                            <div class="metric">
+                                <span class="metric-val" id="m-selectors">0%</span>
+                                <span class="metric-key">selector hit</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flywheel-platforms" id="flywheel-platforms"></div>
+                </div>
+
+                <!-- Memory Panel -->
+                <div class="glass-card side-card">
+                    <div class="card-tabs">
+                        <button class="tab-btn active" data-tab="tab-profile">Candidate Profile</button>
+                        <button class="tab-btn" data-tab="tab-memory">Learned Q&amp;A (<span id="qa-count">0</span>)</button>
+                    </div>
+
+                    <!-- Tab 1: Profile Form -->
+                    <div class="tab-pane active" id="tab-profile">
+                        <form id="profile-form" class="custom-form">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Full Name</label>
+                                    <input type="text" name="name" id="p-name" placeholder="e.g. Alex Zhang">
+                                </div>
+                                <div class="form-group">
+                                    <label>Email</label>
+                                    <input type="email" name="email" id="p-email" placeholder="alex@example.com">
+                                </div>
+                            </div>
+
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Phone Number</label>
+                                    <input type="text" name="phone" id="p-phone" placeholder="+1 (555) 019-2834">
+                                </div>
+                                <div class="form-group">
+                                    <label>Location</label>
+                                    <input type="text" name="location" id="p-location" placeholder="Austin, TX">
+                                </div>
+                            </div>
+
+                            <div class="form-group">
+                                <label>Resume Absolute Path (.pdf)</label>
+                                <input type="text" name="resume_path" id="p-resume" placeholder="/Users/you/resume.pdf">
+                            </div>
+
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Work Authorization</label>
+                                    <select name="work_authorization" id="p-work-auth">
+                                        <option value="US Citizen">US Citizen</option>
+                                        <option value="Permanent Resident (Green Card)">Permanent Resident (Green Card)</option>
+                                        <option value="Requires Visa Sponsorship">Requires Visa Sponsorship</option>
+                                        <option value="F1/OPT/STEM OPT">F1/OPT/STEM OPT</option>
+                                        <option value="Authorized to work for any employer">Authorized for any employer</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label>Years of Experience</label>
+                                    <input type="number" name="years_of_experience" id="p-yoe" placeholder="5" min="0">
+                                </div>
+                            </div>
+
+                            <div class="form-group">
+                                <label>LinkedIn Profile URL</label>
+                                <input type="url" name="linkedin_url" id="p-linkedin" placeholder="https://linkedin.com/in/username">
+                            </div>
+
+                            <div class="form-actions">
+                                <button type="submit" class="glow-btn full-width">Save Candidate Profile</button>
+                            </div>
+                        </form>
+                    </div>
+
+                    <!-- Tab 2: Learned Memory List -->
+                    <div class="tab-pane" id="tab-memory">
+                        <div class="qa-toolbar">
+                            <input type="text" id="qa-search" placeholder="Search learned answers..." class="search-input">
+                        </div>
+                        <div class="qa-items-container" id="qa-list">
+                            <div class="empty-list">No learned question-answer pairs yet. The agent will ask you when needed and remember your answers automatically!</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- History Card -->
+                <div class="glass-card side-card">
+                    <div class="card-header border-bottom">
+                        <h3>Application Tracking</h3>
+                        <span class="sub-count" id="history-count">0 recorded</span>
+                    </div>
+                    <div class="history-container" id="history-list">
+                        <div class="empty-list">No job applications submitted yet.</div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Settings Modal -->
+    <div class="overlay-modal hidden" id="settings-modal">
+        <div class="modal-card settings-card">
+            <div class="modal-header">
+                <h3>Agent Configuration</h3>
+                <button class="close-btn" id="close-settings-btn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="settings-form" class="custom-form">
+                    <div class="form-group">
+                        <label>LLM Intelligence Engine</label>
+                        <select name="llm_provider" id="cfg-provider">
+                            <option value="claude">Anthropic Claude (Native Computer Use)</option>
+                            <option value="openai">OpenAI (GPT-4o Vision)</option>
+                            <option value="gemini">Google Gemini (Gemini 2.5 Flash)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Model Override (Optional)</label>
+                        <input type="text" name="llm_model" id="cfg-model" placeholder="Leave empty for recommended default">
+                    </div>
+                    <div class="form-group">
+                        <label>Max Actions per Job</label>
+                        <input type="number" name="max_actions_per_job" id="cfg-max-actions" value="50" min="5" max="150">
+                    </div>
+                    <div class="form-group check-group">
+                        <label class="switch-label">
+                            <input type="checkbox" name="headless" id="cfg-headless">
+                            <span class="switch-slider"></span>
+                            <span>Headless Mode (Hide real browser window)</span>
+                        </label>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="secondary-btn" id="cancel-settings-btn">Cancel</button>
+                        <button type="submit" class="glow-btn">Apply Settings</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notifications Container -->
+    <div class="toast-container" id="toast-shelf"></div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
