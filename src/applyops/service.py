@@ -37,6 +37,7 @@ from .memory import MemoryStore
 from .resume import ResumeRef
 from .state_machine import ApplicationState, InvalidTransition
 from .submission import (
+    STATUS_UNVERIFIED,
     FinalAction,
     SubmissionRefused,
     SubmitOutcome,
@@ -265,28 +266,76 @@ class ApplicationService:
                 "unverified": ApplicationState.SUBMITTED_UNVERIFIED,
                 "failed": ApplicationState.FAILED,
             }[outcome.status]
+
+            # The state moves first: whatever happens to the bookkeeping next,
+            # the ledger must not be left claiming the application is still mid-
+            # submission when a human asks.
             self.ledger.transition(application_id, target)
-            self.ledger.finish_attempt(
-                attempt.id,
-                outcome=outcome.status,
-                detail=outcome.detail,
-                grant_id=grant_id,
-                evidence=outcome.evidence,
-            )
-            self._record_in_memory(row, outcome)
-            self._record_in_rails(outcome)
+            try:
+                self.ledger.finish_attempt(
+                    attempt.id,
+                    outcome=outcome.status,
+                    detail=outcome.detail,
+                    grant_id=grant_id,
+                    evidence=outcome.evidence,
+                )
+                self._record_in_memory(row, outcome)
+                self._record_in_rails(outcome)
+            except Exception as exc:  # noqa: BLE001 - the submission already happened
+                # Bookkeeping failed *after* the external action. The outcome is
+                # still the truth of what the employer received, so it is
+                # reported as-is and the failure is attached to it -- reporting
+                # "failed" here would say nothing was sent when something was.
+                outcome.evidence = {
+                    **outcome.evidence,
+                    "bookkeeping_error": f"{type(exc).__name__}: {exc}",
+                }
+                outcome.detail = (
+                    f"{outcome.detail} [note: recording the attempt failed "
+                    f"({type(exc).__name__}); the submission itself is unaffected]"
+                )
             return outcome
         except Exception as exc:
-            # An exception before any external action is a FAILED attempt. The
-            # landing is only legal from SUBMITTING -- if the row already moved
-            # to a terminal outcome, leave it exactly where it is rather than
-            # inventing a second story about the same attempt.
+            # An exception *after* the grant was spent means the click may have
+            # happened: the request could be at the employer right now, so this
+            # is unknown, not failed. Only an exception raised before the grant
+            # was consumed -- i.e. provably before anything was sent -- lands the
+            # attempt as FAILED, which is the one state a retry may start from.
+            spent = self.authorizer.peek(grant_id)
+            sent_possible = bool(spent and spent.used)
+            status = "unverified" if sent_possible else "failed"
+            landing = (
+                ApplicationState.SUBMITTED_UNVERIFIED
+                if sent_possible
+                else ApplicationState.FAILED
+            )
+
             current = self.ledger.get(application_id)
             if current is not None and current.state == ApplicationState.SUBMITTING.value:
-                self.ledger.transition(application_id, ApplicationState.FAILED)
+                self.ledger.transition(application_id, landing)
             self.ledger.finish_attempt(
-                attempt.id, outcome="failed", detail=str(exc)
+                attempt.id,
+                outcome=status,
+                detail=f"{type(exc).__name__}: {exc}",
+                grant_id=grant_id,
+                evidence={"sent": sent_possible, "exception": type(exc).__name__},
             )
+            if sent_possible:
+                return SubmitOutcome(
+                    status=STATUS_UNVERIFIED,
+                    job_key=row.job_key,
+                    grant_id=grant_id,
+                    detail=(
+                        "the submission was pressed but the attempt could not be "
+                        f"completed ({type(exc).__name__}: {exc}). Treat it as "
+                        "possibly-submitted: do not submit again, reconcile instead."
+                    ),
+                    evidence={
+                        "sent": True,
+                        "reconciliation_required": True,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
             raise
         finally:
             self.ledger.release_claim(application_id, self.owner)
@@ -299,19 +348,39 @@ class ApplicationService:
         action: FinalAction,
         evidence_timeout: float = 8.0,
     ) -> SubmitOutcome:
-        """Re-read the page for a possibly-submitted application. Never clicks."""
+        """Re-read the page for a possibly-submitted application. Never clicks.
+
+        Reconciliation can only *raise* confidence, and only when the evidence is
+        provably about this application: the page on screen has to be the page the
+        attempt was made from. A browser left on another posting's success page
+        proves nothing here, and the application stays unverified.
+        """
         row = self.ledger.get(application_id)
         if row is None:
             raise KeyError(f"unknown application {application_id}")
+
+        expected_page_identity = ""
+        attempts = self.ledger.attempts(application_id)
+        if attempts:
+            grant = self.authorizer.peek(attempts[-1].grant_id) if attempts[-1].grant_id else None
+            if grant is not None:
+                expected_page_identity = grant.page_identity
+
         outcome = await reconcile_submission(
-            controller=controller, action=action, evidence_timeout=evidence_timeout
+            controller=controller,
+            action=action,
+            evidence_timeout=evidence_timeout,
+            expected_page_identity=expected_page_identity,
+            expected_application_id=application_id,
         )
-        if outcome.verified:
+        outcome.job_key = row.job_key
+        if outcome.verified and outcome.evidence.get("ownership_proven"):
             self.ledger.transition(
                 application_id, ApplicationState.SUBMITTED_VERIFIED,
                 payload={"via": "reconciliation"},
             )
             self._record_in_memory(row, outcome, reconcile=True)
+            self._record_in_rails(outcome)
         return outcome
 
     def cancel(self, application_id: str, *, reason: str = "") -> ApplicationRow:

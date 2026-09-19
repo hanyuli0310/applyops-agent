@@ -198,6 +198,10 @@ def _form(scenario: str) -> str:
       be answered by inference.
     - `resume` is the attachment, and in the `stale` scenario the page also offers
       a previously uploaded file, pre-selected.
+
+    The `scenario` also selects what the *response* does: `standard` confirms,
+    `silent` accepts without confirming (the honest "we do not know" case),
+    `error` refuses, `slow` never answers, `stale` offers an old attachment.
     """
     stale_block = ""
     if scenario == "stale":
@@ -257,6 +261,9 @@ class DemoATS:
         #: any validation problems. Tests assert against this rather than against
         #: the word "received", because the interesting question is *what* arrived.
         self.last_submission: dict = {}
+        #: How many submissions this ATS has received. The number is the point:
+        #: "exactly once" is only checkable if somebody counts.
+        self.submission_count = 0
 
     @property
     def url(self) -> str:
@@ -315,6 +322,10 @@ class DemoATS:
             def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b""
+                # Counted here, before any scenario branch: the number answers
+                # "did the employer receive a request", which is true regardless
+                # of what the page does next (answer, fail, or never respond).
+                outer.submission_count += 1
                 parsed = urlparse(self.path)
                 scenario = parse_qs(parsed.query).get("scenario", ["standard"])[0]
 
@@ -339,6 +350,17 @@ class DemoATS:
                     "files": files,
                     "path": self.path,
                 }
+
+                if scenario == "silent":
+                    self._write(
+                        200,
+                        _page(
+                            "Thank you — Demo ATS",
+                            "<p>Your submission has been queued for review. "
+                            "No reference number is available yet.</p>",
+                        ),
+                    )
+                    return
 
                 if scenario == "error":
                     self._write(

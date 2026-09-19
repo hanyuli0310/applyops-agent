@@ -55,9 +55,6 @@ from ..submission import (
     FinalAction,
     SubmissionRefused,
 )
-from ..submission import (
-    reconcile_submission as reconcile_submission_impl,
-)
 from .runtime import BrowserBusy, Runtime
 
 # A tool call that blocks this long is a bug, not a rate limit.
@@ -1144,27 +1141,54 @@ def register(server: MCPServer, runtime: Runtime) -> None:
             )
 
     @server.tool()
-    async def reconcile_submission(evidence_text: str = "", final_ref: str = "") -> str:
+    async def reconcile_submission(
+        application_id: str = "", evidence_text: str = "", final_ref: str = ""
+    ) -> str:
         """Find out what happened to a possibly-submitted application.
 
-        Read-only. It clicks nothing, submits nothing and can only ever raise its
-        own confidence: reading an unchanged page leaves the result `unverified`
-        and says so, rather than quietly upgrading a guess into a success.
+        Read-only: it clicks nothing, submits nothing, and can only ever raise
+        its own confidence. Reading an unchanged page leaves the result
+        `unverified` and says so rather than upgrading a guess into a success.
+
+        Pass `application_id`: reconciliation is only allowed to confirm an
+        application when the evidence is provably about *that* application's
+        attempt, which means the page on screen has to be the page the attempt
+        was made from. Without it there is nothing to bind to, and the answer is
+        refused rather than guessed.
         """
+        if not application_id:
+            return _json(
+                {
+                    "reconciled": False,
+                    "error": (
+                        "application_id is required: this page's evidence can only be "
+                        "attributed to a specific application and attempt"
+                    ),
+                }
+            )
         async with runtime.lock:
             browser = await runtime.get_browser()
             patterns = (evidence_text,) if evidence_text else success_patterns_for(
                 browser.page.url
             )
-            outcome = await reconcile_submission_impl(
-                controller=browser,
-                action=FinalAction(
-                    ref=final_ref,
-                    success_patterns=patterns,
-                ),
-                evidence_timeout=8.0,
-            )
-            return _json(outcome.to_dict())
+            try:
+                outcome = await runtime.service.reconcile(
+                    application_id,
+                    controller=browser,
+                    action=FinalAction(ref=final_ref, success_patterns=patterns),
+                    evidence_timeout=8.0,
+                )
+            except KeyError:
+                return _json({"reconciled": False, "error": "unknown application"})
+            payload = outcome.to_dict()
+            payload["application_id"] = application_id
+            if not outcome.verified:
+                payload["next_step"] = (
+                    "nothing was resubmitted. If the employer's site or the user's "
+                    "inbox confirms it, that is news for the person to record; the "
+                    "browser cannot prove it from here."
+                )
+            return _json(payload)
 
     @server.tool()
     async def enqueue_application(

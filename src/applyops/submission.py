@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 
 from .action_policy import ClickClass, ClickDecision, decide_click
-from .authorization import SubmissionAuthorizer, snapshot_digest
+from .authorization import SubmissionAuthorizer, page_identity_of, snapshot_digest
 from .browser import BrowserController
 from .resume import ResumeRef
 from .verification import Verification
@@ -238,9 +238,31 @@ async def execute_authorized_submission(
         )
 
     if action.success_patterns:
-        found, pattern, url = await _wait_for_evidence(
-            controller, action.success_patterns, evidence_timeout
-        )
+        try:
+            found, pattern, url = await _wait_for_evidence(
+                controller, action.success_patterns, evidence_timeout
+            )
+        except Exception as exc:  # noqa: BLE001 - the submit may already have happened
+            # The request has left the machine and we could not read the answer
+            # (the tab closed, the browser went away, the page crashed). That is
+            # the definition of unknown: reporting a failure here would invite a
+            # retry of something the employer may already have received.
+            return SubmitOutcome(
+                status=STATUS_UNVERIFIED,
+                job_key=job_key,
+                grant_id=grant_id,
+                detail=(
+                    "the submission was sent but the page could not be read "
+                    f"afterwards ({type(exc).__name__}: {exc}). Treat it as "
+                    "possibly-submitted: do not submit again, reconcile instead."
+                ),
+                evidence={
+                    "sent": True,
+                    "reconciliation_required": True,
+                    "evidence_error": f"{type(exc).__name__}: {exc}",
+                    "resume": resume.to_dict(),
+                },
+            )
     else:
         # No success signal configured for this route: saying "verified" would be
         # inventing evidence, so the only honest verdict is unknown.
@@ -316,13 +338,43 @@ async def reconcile_submission(
     controller: BrowserController,
     action: FinalAction,
     evidence_timeout: float = DEFAULT_EVIDENCE_TIMEOUT,
+    expected_page_identity: str = "",
+    expected_application_id: str = "",
 ) -> SubmitOutcome:
     """Find out what happened to a possibly-submitted application.
 
     Read-only by construction: it never clicks, never re-submits, never presses
     anything. It answers from whatever the page says right now, and if the page
     still says nothing, the honest answer remains `unverified`.
+
+    **Evidence has to be about this attempt.** A confirmation page proves a
+    submission happened *somewhere*; it does not say which application it belongs
+    to, and a browser that has moved on to another posting's success page will
+    happily show one. So when the caller can name the page the attempt was made
+    from, that page must be the one on screen before any success text counts.
+    Without that check, application A is confirmed by application B's receipt --
+    a fabricated success produced without forging anything.
     """
+    live_identity = page_identity_of(controller.page.url)
+    observed = {
+        "url": controller.page.url,
+        "observed_page_identity": live_identity,
+        "expected_page_identity": expected_page_identity,
+        "application_id": expected_application_id,
+        "reconciled": True,
+    }
+    if expected_page_identity and live_identity != expected_page_identity:
+        return SubmitOutcome(
+            status=STATUS_UNVERIFIED,
+            detail=(
+                f"the browser is on {live_identity!r}, but this attempt was made from "
+                f"{expected_page_identity!r}. This page's evidence is not about this "
+                "application, so ownership cannot be proven; it stays unverified. "
+                "Open the application's own page and reconcile again."
+            ),
+            evidence={**observed, "ownership_proven": False},
+        )
+
     if action.success_patterns:
         found, pattern, url = await _wait_for_evidence(
             controller, action.success_patterns, evidence_timeout
@@ -331,7 +383,13 @@ async def reconcile_submission(
             return SubmitOutcome(
                 status=STATUS_VERIFIED,
                 detail="reconciled: the page reports a successful submission",
-                evidence={"matched_text": pattern, "url": url, "reconciled": True},
+                evidence={
+                    "matched_text": pattern,
+                    "url": url,
+                    "reconciled": True,
+                    "ownership_proven": bool(expected_page_identity),
+                    **observed,
+                },
             )
     return SubmitOutcome(
         status=STATUS_UNVERIFIED,
@@ -339,7 +397,7 @@ async def reconcile_submission(
             "still no confirmation on the page. Nothing was resubmitted. Check the "
             "employer's site or inbox directly, then record the real result."
         ),
-        evidence={"url": controller.page.url, "reconciled": True},
+        evidence={**observed, "ownership_proven": bool(expected_page_identity)},
     )
 
 
