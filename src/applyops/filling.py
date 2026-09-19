@@ -49,9 +49,9 @@ SPONSORSHIP_PATTERN = re.compile(r"sponsor", re.IGNORECASE)
 
 FILE_LABEL_PATTERN = re.compile(r"resume|cv\b|curriculum", re.IGNORECASE)
 
-#: Bare yes/no option labels. Meaningless alone -- the question lives in the page
-#: text -- so they are only resolved when the page itself asks about sponsorship.
-BARE_CHOICE_PATTERN = re.compile(r"^(yes|no)$", re.IGNORECASE)
+#: Bare yes/no option text. Meaningless on its own: the question is the *group*
+#: it sits in, which is where the answer has to come from.
+BARE_CHOICE_PATTERN = re.compile(r"^(yes|no|true|false|是|否)$", re.IGNORECASE)
 
 
 @dataclass
@@ -141,20 +141,9 @@ async def fill_application_form(
     state = await controller.get_page_state()
     fields = state.form_fields
 
-    # Read once: a bare "Yes"/"No" option is only answerable in context, and the
-    # context is the question the page prints above it.
-    try:
-        page_text = (await controller.page.inner_text("body")).casefold()
-    except Exception:  # noqa: BLE001 - context is optional, absence is handled
-        page_text = ""
-
-    sponsorship_choice = _sponsorship_choice(
-        page_text=page_text,
-        profile=profile,
-        answers=answers,
-        company=company,
-        application_id=application_id,
-    )
+    # One report per question, so a two-option group is not counted twice and a
+    # question that was never answered cannot be skipped over.
+    reported_questions: set[str] = set()
 
     for control in fields:
         label = (control.label or "").strip()
@@ -171,30 +160,41 @@ async def fill_application_form(
             company=company,
             application_id=application_id,
         )
-        is_bare_choice = bool(BARE_CHOICE_PATTERN.match(label))
-        if is_bare_choice and "sponsor" in page_text:
-            # A yes/no group is one question with two buttons. Only the option
-            # the user's own answer selects is clicked; the sibling is skipped
-            # silently rather than reported as a second missing answer.
-            if sponsorship_choice and label.strip().casefold() == sponsorship_choice:
-                # The value here is the *state* to set, not the option's text.
-                # Passing "No" for a boolean would read as falsy and uncheck the
-                # very radio we chose -- which is how this shipped a form whose
-                # sponsorship question was silently unanswered.
-                resolved = ("yes", "profile:requires_sponsorship")
-            else:
+        is_choice = field_type in {"radio", "checkbox"} or bool(
+            BARE_CHOICE_PATTERN.match(label)
+        )
+        if is_choice and BARE_CHOICE_PATTERN.match(label):
+            question = question_for(label, control.group_label)
+            wanted, source = choice_answer(
+                question,
+                profile=profile,
+                answers=answers,
+                company=company,
+                application_id=application_id,
+            )
+            if wanted is None:
+                # No answer for this question: name it once and move on. The
+                # option is left untouched -- guessing here is how an unrelated
+                # "Yes" ends up answering a question the user never saw.
+                key = question or label
+                if key not in reported_questions:
+                    reported_questions.add(key)
+                    bucket = report.unfilled_required if control.required else report.unfilled_optional
+                    bucket.append(question or f"{label} (question could not be identified)")
                 continue
+            option_is_yes = bool(BARE_CHOICE_PATTERN.match(label)) and label.strip().casefold() in {
+                "yes",
+                "true",
+                "是",
+            }
+            if option_is_yes != wanted:
+                continue  # the sibling option; the wanted one is handled below
+            # The value here is the *state* to set, not the option's text. Passing
+            # "No" for a boolean reads as falsy and unchecks the very radio we
+            # chose, which is how a sponsorship question once shipped blank.
+            resolved = ("yes", source)
 
         if resolved is None:
-            # Sponsorship is the one label worth naming specially: it is the
-            # question whose wrong answer has real consequences, so the report
-            # should say it was left unanswered rather than quietly unfilled.
-            if is_bare_choice and "sponsor" in page_text:
-                # The page asks about sponsorship and nothing answers it: report
-                # the group once, by the question rather than by two options.
-                if "sponsorship question" not in report.unfilled_required:
-                    report.unfilled_required.append("sponsorship question")
-                continue
             target = (
                 report.unfilled_required
                 if (control.required or SPONSORSHIP_PATTERN.search(label))
@@ -254,39 +254,68 @@ async def fill_application_form(
     return report
 
 
-def _sponsorship_choice(
+def _as_bool(value: str) -> bool | None:
+    """Read a Yes/No answer out of prose, or None when it is not one.
+
+    A stored answer is a sentence the user typed ("No, I do not require
+    sponsorship"), so the leading word decides and anything ambiguous is None --
+    which parks the application rather than picking a side.
+    """
+    text = (value or "").strip().casefold()
+    if not text:
+        return None
+    if text in {"yes", "y", "true", "1", "是"} or text.startswith("yes"):
+        return True
+    if text in {"no", "n", "false", "0", "否"} or text.startswith("no"):
+        return False
+    return None
+
+
+def question_for(label: str, group_label: str) -> str:
+    """The question a control answers.
+
+    A bare "Yes"/"No" option carries no question of its own: the question is the
+    group it belongs to. Anything else is its own question and is answered by its
+    own label. This one rule is what stops one question's answer being written
+    into another's box.
+    """
+    if BARE_CHOICE_PATTERN.match((label or "").strip()):
+        return (group_label or "").strip()
+    return (label or "").strip()
+
+
+def choice_answer(
+    question: str,
     *,
-    page_text: str,
     profile: dict[str, str],
     answers: AnswerStore,
     company: str = "",
     application_id: str = "",
-) -> str | None:
-    """Which yes/no option the user's own answer selects, or None.
+) -> tuple[bool, str] | tuple[None, str]:
+    """(answer, source) for a Yes/No question, or (None, "") if we do not know.
 
-    Only consulted when the page itself asks about sponsorship, because a bare
-    "Yes"/"No" carries no meaning without its question. A scoped answer wins over
-    the profile -- it is the user speaking about this form.
+    The user's own answer for this exact question wins. Failing that, a question
+    that is *about sponsorship* may be answered from the profile's
+    `requires_sponsorship`, because that field is the user's answer to precisely
+    that question. Nothing else is inferred: an unanswered question stays
+    unanswered.
     """
-    if "sponsor" not in page_text:
-        return None
+    if not question:
+        return None, ""
 
-    entry = answers.resolve(
-        "Do you require sponsorship?", company=company, application_id=application_id
-    ) or answers.resolve("Visa sponsorship", company=company, application_id=application_id)
+    entry = answers.resolve(question, company=company, application_id=application_id)
     if entry is not None:
-        value = entry.answer.strip().casefold()
-    else:
-        value = (profile.get("requires_sponsorship") or "").strip().casefold()
-    if not value:
-        return None
+        parsed = _as_bool(entry.answer)
+        if parsed is not None:
+            return parsed, f"answer:{entry.scope}"
+        return None, ""
 
-    # "No, I do not require sponsorship" -> pick "No". The negations are listed
-    # because a stored answer is prose, not a boolean.
-    wants_yes = value in {"yes", "y", "true", "1", "是"} or value.startswith("yes")
-    if value.startswith("no") or value in {"n", "false", "0", "否"}:
-        wants_yes = False
-    return "yes" if wants_yes else "no"
+    if SPONSORSHIP_PATTERN.search(question):
+        parsed = _as_bool(profile.get("requires_sponsorship") or "")
+        if parsed is not None:
+            return parsed, "profile:requires_sponsorship"
+
+    return None, ""
 
 
 def _file_input_ref(fields) -> str | None:

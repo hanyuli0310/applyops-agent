@@ -84,6 +84,8 @@ class FieldControl(BaseModel):
     ref: str  # reference string the caller hands back to act on this field
     label: str = ""
     label_source: str = ""  # label[for] | aria-label | aria-labelledby | placeholder | option-label | none
+    group_label: str = ""  # the question this control answers, from its fieldset/ARIA group
+    name: str = ""  # the form field name, which is what makes one radio option unique
     tag: str = ""
     field_type: str = "text"
     value: str = ""
@@ -152,6 +154,32 @@ _JS_DESCRIBE = """
     }
   }
   if (!label && attr('placeholder')) { label = norm(attr('placeholder')); how = 'placeholder'; }
+
+  // Which *question* does this control answer? For a bare "Yes"/"No" radio the
+  // label is not the question, and answering by label is how one question's
+  // answer ends up in another's box. The group is what binds them, and it is
+  // taken from the nearest fieldset legend or ARIA group label -- inside this
+  // control's own group only, never from the page as a whole.
+  let group = '';
+  let node = el;
+  for (let i = 0; i < 6 && node; i++) {
+    const tag = (node.tagName || '').toLowerCase();
+    if (tag === 'fieldset') {
+      const legend = node.querySelector('legend');
+      if (legend && norm(legend.textContent)) { group = norm(legend.textContent); }
+      break;
+    }
+    const role = (node.getAttribute && (node.getAttribute('role') || '')) || '';
+    if (role === 'group' || role === 'radiogroup') {
+      const own = norm(node.getAttribute('aria-label') || '');
+      const byId = (node.getAttribute('aria-labelledby') || '');
+      const referenced = byId && root.getElementById ? root.getElementById(byId) : null;
+      const text = own || (referenced ? norm(referenced.textContent) : '');
+      if (text) { group = text; }
+      break;
+    }
+    node = node.parentElement;
+  }
 
   // A label rendered twice is noise, not a different question. LinkedIn does
   // this for screen readers: "Email addressEmail address", and also as two
@@ -224,7 +252,9 @@ _JS_DESCRIBE = """
     role: role,
     label: label.slice(0, 200),
     labelSource: how,
+    groupLabel: group,
     fieldType: fieldType,
+    name: attr('name') || '',
     value: (el.value === undefined || el.value === null) ? '' : String(el.value).slice(0, 200),
     required: !!el.required || attr('aria-required') === 'true',
     disabled: !!el.disabled || attr('aria-disabled') === 'true',
@@ -262,6 +292,19 @@ def build_ref(info: dict) -> str:
     automation = info.get("automationId") or ""
     if automation:
         return f"auto={automation}"
+
+    field_type = (info.get("fieldType") or "").lower()
+    name = info.get("name") or ""
+    value = info.get("value")
+    if field_type in {"radio", "checkbox"} and name:
+        # `label=Yes` is ambiguous the moment a page has two Yes/No questions:
+        # the reference for the first group's "Yes" also matches the second
+        # group's, so one of them was silently dropped at collection time and
+        # could never be answered. name+value addresses exactly one option.
+        selector = f'[name="{_css_quote(name)}"]'
+        if value not in (None, ""):
+            selector += f'[value="{_css_quote(str(value))}"]'
+        return f"css={selector}"
 
     element_id = info.get("id") or ""
     if not _is_noise_id(element_id):
@@ -396,6 +439,8 @@ async def _describe(locator: Locator, limit: int, frame_url: str = "") -> list[F
                 ref=ref,
                 label=info.get("label", ""),
                 label_source=info.get("labelSource", ""),
+                group_label=info.get("groupLabel", ""),
+                name=info.get("name", ""),
                 tag=info.get("tag", ""),
                 field_type=info.get("fieldType", "text"),
                 value=info.get("value", ""),
@@ -427,7 +472,11 @@ async def resolve_fields(page: Page, limit_per_frame: int = 120) -> list[FieldCo
         except Exception:
             continue
         for control in controls:
-            key = f"{control.ref}|{control.label}"
+            # The group is part of the identity: two Yes/No questions on one page
+            # produce controls with the same label and (before the ref fix) the
+            # same reference, and collapsing them meant only the first question
+            # was ever seen, let alone answered.
+            key = f"{control.ref}|{control.label}|{control.group_label}"
             if key in seen:
                 continue
             seen.add(key)

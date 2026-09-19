@@ -44,6 +44,22 @@ FAILED_TEXT = "There was a problem with your submission"
 REQUIRED_FIELDS = ("name", "email", "phone", "years", "notice_period", "needs_sponsorship")
 REQUIRED_FILE_FIELD = "resume"
 
+#: Three independent Yes/No questions on one page, each in its own fieldset with
+#: a legend. They exist so that "answer the sponsorship question" cannot be
+#: mistaken for "answer every Yes/No on the page" -- the two failure modes this
+#: fixture is built to catch are cross-answering and silently skipping.
+CHOICE_QUESTIONS = {
+    "work_authorised": (
+        "Are you legally authorised to work in the United States?",
+        "yes",
+    ),
+    "needs_sponsorship": (
+        "Do you now, or will you in the future, require visa sponsorship?",
+        "no",
+    ),
+    "worked_here_before": ("Have you previously worked at ApplyOps Demo Co?", "yes"),
+}
+
 
 def parse_multipart(body: bytes, content_type: str) -> tuple[dict[str, str], dict[str, str]]:
     """Pull fields and filenames out of a multipart/form-data body.
@@ -128,6 +144,46 @@ def _index(base: str) -> str:
     )
 
 
+def _choices_form() -> str:
+    """Three Yes/No groups, each bound to its own question by a fieldset legend."""
+    groups = []
+    for name, (question, _expected) in CHOICE_QUESTIONS.items():
+        groups.append(
+            f"<fieldset><legend>{html.escape(question)}</legend>"
+            f"<label><input type='radio' name='{name}' value='yes' required> Yes</label>"
+            f"<label><input type='radio' name='{name}' value='no' required> No</label>"
+            "</fieldset>"
+        )
+    return _page(
+        "Screening — Demo ATS",
+        "<div class='banner'>Three short screening questions. Each one is "
+        "independent; the form does not accept a partial answer.</div>"
+        "<h1>Screening questions</h1>"
+        "<form method='post' action='/submit' enctype='multipart/form-data'>"
+        "<label for='name'>Full name</label>"
+        "<input id='name' name='name' type='text' required>"
+        + "".join(groups)
+        + "<label for='resume'>Resume</label>"
+        "<input id='resume' name='resume' type='file' required>"
+        "<button type='submit'>Submit application</button>"
+        "</form>",
+    )
+
+
+def validate_choices(fields: dict[str, str], files: dict[str, str]) -> list[str]:
+    """Every question answered, with a value the form actually offers."""
+    problems: list[str] = []
+    if not fields.get("name"):
+        problems.append("missing or empty field: name")
+    for name in CHOICE_QUESTIONS:
+        value = (fields.get(name) or "").strip().lower()
+        if value not in {"yes", "no"}:
+            problems.append(f"question {name!r} was not answered")
+    if not files.get(REQUIRED_FILE_FIELD):
+        problems.append("no resume file attached")
+    return problems
+
+
 def _form(scenario: str) -> str:
     """One application form, with variations selected by `scenario`.
 
@@ -176,10 +232,11 @@ def _form(scenario: str) -> str:
         "<option value='two_weeks'>Two weeks</option>"
         "<option value='one_month'>One month</option>"
         "</select>"
-        "<label>Do you now, or will you in the future, require visa sponsorship?"
-        "</label>"
+        "<fieldset><legend>Do you now, or will you in the future, require visa "
+        "sponsorship?</legend>"
         "<label><input type='radio' name='needs_sponsorship' value='yes' required> Yes</label>"
         "<label><input type='radio' name='needs_sponsorship' value='no' required> No</label>"
+        "</fieldset>"
         f"{stale_block}"
         "<label for='resume'>Resume</label>"
         "<input id='resume' name='resume' type='file' required>"
@@ -240,6 +297,9 @@ class DemoATS:
                 if parsed.path == "/form":
                     self._write(200, _form(scenario))
                     return
+                if parsed.path == "/choices":
+                    self._write(200, _choices_form())
+                    return
                 if parsed.path == "/-/last-submission":
                     payload = json.dumps(outer.last_submission, ensure_ascii=False).encode(
                         "utf-8"
@@ -294,7 +354,11 @@ class DemoATS:
 
                 # Real validation, because a demo that accepts anything cannot
                 # tell a working filler from a broken one.
-                problems = validate_submission(fields, files)
+                problems = (
+                    validate_choices(fields, files)
+                    if parsed.path == "/choices"
+                    else validate_submission(fields, files)
+                )
                 if problems:
                     outer.last_submission["problems"] = problems
                     self._write(
