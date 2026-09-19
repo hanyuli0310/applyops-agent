@@ -29,6 +29,7 @@ from pathlib import Path
 
 from .answers import AnswerStore
 from .browser import BrowserController
+from .company_policy import CompanyDecision, CompanyPolicyStore
 from .concurrency import atomic_write_json, data_lock_path, read_json
 from .evidence import detect_final_action
 from .filling import fill_application_form
@@ -116,6 +117,7 @@ class PassReport:
     prepared: list[dict] = field(default_factory=list)
     submitted: list[dict] = field(default_factory=list)
     parked: list[dict] = field(default_factory=list)
+    skipped: list[dict] = field(default_factory=list)
     refused: list[dict] = field(default_factory=list)
     stopped_reason: str = ""
     #: How many this pass was allowed to send, and how many of those are left.
@@ -136,11 +138,13 @@ class QueueRunner:
         memory: MemoryStore | None = None,
         answers: AnswerStore | None = None,
         policy_store: PolicyStore | None = None,
+        company_policy_store: CompanyPolicyStore | None = None,
     ):
         self.service = service
         self.memory = memory or service.memory
         self.answers = answers or AnswerStore(service.data_dir)
         self.policy_store = policy_store or PolicyStore(service.data_dir)
+        self.company_policy_store = company_policy_store or CompanyPolicyStore(service.data_dir)
         self._paused = False
         self._stopped = False
 
@@ -220,6 +224,11 @@ class QueueRunner:
 
         # 3. Prepare queued work under the policy.
         policy = limit
+        company_policy = (
+            self.company_policy_store.get()
+            if self.company_policy_store.path.exists()
+            else None
+        )
         for row in self.service.list(ApplicationState.QUEUED.value):
             if self._stopped:
                 report.stopped_reason = "stopped by operator"
@@ -227,6 +236,25 @@ class QueueRunner:
             if self._paused:
                 report.stopped_reason = "paused by operator"
                 break
+
+            company_decision = (
+                company_policy.decision(row.company)
+                if company_policy is not None
+                else None
+            )
+            if company_decision is CompanyDecision.NEVER:
+                self.service.skip(
+                    row.id,
+                    reason=f"company {row.company!r} is in the never list",
+                )
+                report.skipped.append(
+                    {
+                        "application_id": row.id,
+                        "company": row.company,
+                        "reason": f"company {row.company!r} is in the never list",
+                    }
+                )
+                continue
 
             if policy.allowed_platforms and row.platform not in policy.allowed_platforms:
                 report.refused.append(
@@ -259,8 +287,30 @@ class QueueRunner:
                 {
                     "application_id": row.id,
                     "request_id": prepared.get("request_id", ""),
+                    "company_policy": (
+                        company_decision.value if company_decision is not None else "manual"
+                    ),
                 }
             )
+
+            # The existing request -> grant path remains the authorization
+            # boundary.  AUTO merely supplies the policy's explicit decision as
+            # the source; it never bypasses the snapshot/page checks.
+            if (
+                company_decision is CompanyDecision.AUTO
+                and effective > 0
+                and prepared.get("request_id")
+            ):
+                grant = self.service.authorizer.approve_request(
+                    prepared["request_id"], source="company_policy_auto"
+                )
+                if grant is None:
+                    report.refused.append(
+                        {
+                            "application_id": row.id,
+                            "reason": "company policy could not authorize the prepared request",
+                        }
+                    )
 
         # 4. Submit only pre-approved work, within budget -- from this pass's
         #    preparations AND anything still waiting from an earlier one.
@@ -341,6 +391,7 @@ class QueueRunner:
             if grant.job_key == job_key and grant.source in {
                 "cli_human",
                 "local_ui_human",
+                "company_policy_auto",
             }:
                 return grant.grant_id
         return ""

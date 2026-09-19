@@ -55,6 +55,10 @@ export interface Application {
   title: string;
   company: string;
   created_at: string;
+  display_state?: string;
+  reason_code?: string;
+  reason_text?: string;
+  available_actions?: string[];
 }
 
 export interface Attempt {
@@ -72,6 +76,10 @@ export interface PendingRequest {
   job_url: string;
   application_id: string;
   created_at: string;
+  company: string;
+  reason: string;
+  reason_code: string;
+  available_actions: string[];
   summary: string;
 }
 
@@ -99,7 +107,23 @@ export interface RunnerStatus {
   stopped: boolean;
   policy_usable: boolean;
   policy: { enabled: boolean; max_applications: number; allowed_platforms: string[] };
-  waiting_for_input: { application_id: string; title: string; missing: string[] }[];
+  company_policy: CompanyPolicy;
+  review_waiting: { application_id: string; title: string; company: string; reason: string }[];
+  waiting_for_input: {
+    application_id: string;
+    title: string;
+    missing: string[];
+    reason_code?: string;
+    reason_text?: string;
+    available_actions?: string[];
+  }[];
+}
+
+export interface CompanyPolicy {
+  default_policy: "auto";
+  review_companies: string[];
+  never_companies: string[];
+  updated_at?: string;
 }
 
 export interface Preferences {
@@ -184,6 +208,15 @@ export const api = {
     ),
   reject: (requestId: string) =>
     request<{ rejected: boolean }>(`/requests/${requestId}/reject`, { method: "POST" }),
+  skipRequest: (requestId: string) =>
+    request<{ skipped: boolean; application_id: string }>(`/requests/${requestId}/skip`, {
+      method: "POST",
+    }),
+  allowCompany: (requestId: string) =>
+    request<{ saved: boolean; company: string; policy: CompanyPolicy }>(
+      `/requests/${requestId}/allow-company`,
+      { method: "POST" }
+    ),
   startDemo: () =>
     request<{ application: Application; demo_url: string }>("/demo/start", { method: "POST" }),
 
@@ -207,6 +240,12 @@ export const api = {
   preferences: () => request<Preferences>("/preferences"),
   savePreferences: (prefs: Preferences) =>
     request<Preferences>("/preferences", { method: "POST", body: JSON.stringify(prefs) }),
+  companyPolicy: () => request<CompanyPolicy>("/company-policy"),
+  saveCompanyPolicy: (policy: CompanyPolicy) =>
+    request<CompanyPolicy>("/company-policy", {
+      method: "POST",
+      body: JSON.stringify(policy),
+    }),
   previewPreference: (body: { title: string; company?: string; location?: string }) =>
     request<{ title: string; keep: boolean; reasons: string[] }>("/preferences/preview", {
       method: "POST",

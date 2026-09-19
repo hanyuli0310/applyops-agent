@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 from ..answers import AnswerScope, AnswerStore
 from ..authorization import SubmissionAuthorizer
 from ..browser import BrowserController
+from ..company_policy import CompanyPolicy, CompanyPolicyStore, normalize_company
 from ..concurrency import FileLock, browser_lock_path, describe_holder
 from ..demo_ats import DemoATS
 from ..evidence import detect_final_action, success_patterns_for
@@ -46,6 +47,7 @@ from ..preferences import JobPreferences, PreferenceStore
 from ..preferences import evaluate as evaluate_job
 from ..prepare import PrepareRefused
 from ..prepare import prepare_application as prepare_application_impl
+from ..presentation import application_view
 from ..resume import ResumeError, resolve_resume
 from ..runner import AutoPolicy, PassBudgetRequired, QueueRunner
 from ..service import ApplicationService
@@ -91,6 +93,12 @@ class PreferencesBody(BaseModel):
     exclude_companies: list[str] = []
 
 
+class CompanyPolicyBody(BaseModel):
+    default_policy: str = "auto"
+    review_companies: list[str] = []
+    never_companies: list[str] = []
+
+
 class PreviewBody(BaseModel):
     title: str
     company: str = ""
@@ -132,6 +140,8 @@ class AppState:
         self.authorizer = SubmissionAuthorizer(self.data_dir)
         self.answers = AnswerStore(self.data_dir)
         self.preferences = PreferenceStore(self.data_dir)
+        self.company_policy = CompanyPolicyStore(self.data_dir)
+        self.company_policy.ensure_defaults()
         self.service = ApplicationService(
             self.data_dir,
             memory=self.memory,
@@ -141,8 +151,25 @@ class AppState:
             guardrails=self.guardrails,
         )
         self.runner = QueueRunner(
-            self.service, memory=self.memory, answers=self.answers
+            self.service,
+            memory=self.memory,
+            answers=self.answers,
+            company_policy_store=self.company_policy,
         )
+        # Normal console use starts in the requested default AUTO mode.  The
+        # existing per-pass budget, guardrails and submission grant checks still
+        # bound every run; this only avoids requiring a second global toggle for
+        # ordinary companies.
+        if not self.runner.policy_store.path.exists():
+            self.runner.policy_store.set(
+                AutoPolicy(
+                    enabled=True,
+                    max_applications=20,
+                    allowed_platforms=(),
+                    expires_at_epoch=0.0,
+                    updated_by="default_company_policy",
+                )
+            )
         self._browser: BrowserController | None = None
         # One page, one writer *within* this process: prepare, submit, runner
         # passes and browser release all take this before touching the page.
@@ -230,6 +257,13 @@ def create_app(
 
     app = FastAPI(title="ApplyOps", version=APP_VERSION, lifespan=lifespan)
     app.state.applyops = state  # reachable for the CLI's demo bootstrap
+
+    def _application_view(row) -> dict:
+        return application_view(
+            row,
+            missing=_latest_missing(state.service, row.id),
+            company_policy=state.company_policy.get().decision(row.company).value,
+        )
 
     LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"}
     SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -351,7 +385,10 @@ def create_app(
     @app.get("/api/applications")
     async def list_applications(state_filter: str = "") -> dict:
         rows = state.service.list(state_filter or None)
-        return {"count": len(rows), "applications": [r.to_dict() for r in rows]}
+        return {
+            "count": len(rows),
+            "applications": [{**r.to_dict(), **_application_view(r)} for r in rows],
+        }
 
     @app.post("/api/applications")
     async def enqueue(body: EnqueueBody) -> dict:
@@ -370,7 +407,11 @@ def create_app(
     @app.get("/api/applications/{application_id}")
     async def application_detail(application_id: str) -> dict:
         try:
-            return state.service.status(application_id)
+            detail = state.service.status(application_id)
+            row = state.service.get(application_id)
+            assert row is not None
+            detail["view"] = _application_view(row)
+            return detail
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
@@ -413,20 +454,27 @@ def create_app(
     @app.get("/api/requests")
     async def pending_requests() -> dict:
         requests = state.authorizer.pending_requests()
+
+        def request_view(request) -> dict:
+            row = state.service.get(request.application_id)
+            view = _application_view(row) if row is not None else {}
+            return {
+                "request_id": request.request_id,
+                "job_key": request.job_key,
+                "job_url": request.job_url,
+                "application_id": request.application_id,
+                "page_identity": request.page_identity,
+                "created_at": request.created_at,
+                "company": view.get("company", ""),
+                "reason_code": view.get("reason_code", "approval_required"),
+                "reason": view.get("reason_text", "申请已准备好，等待人工确认"),
+                "available_actions": view.get("available_actions", ["approve", "skip"]),
+                "summary": request.summary_for_human(),
+            }
+
         return {
             "count": len(requests),
-            "requests": [
-                {
-                    "request_id": r.request_id,
-                    "job_key": r.job_key,
-                    "job_url": r.job_url,
-                    "application_id": r.application_id,
-                    "page_identity": r.page_identity,
-                    "created_at": r.created_at,
-                    "summary": r.summary_for_human(),
-                }
-                for r in requests
-            ],
+            "requests": [request_view(request) for request in requests],
         }
 
     @app.post("/api/requests/{request_id}/approve")
@@ -449,6 +497,41 @@ def create_app(
         if not state.authorizer.reject_request(request_id):
             raise HTTPException(409, "request is not pending")
         return {"rejected": True}
+
+    @app.post("/api/requests/{request_id}/skip")
+    async def skip_request(request_id: str) -> dict:
+        request = state.authorizer.get_request(request_id)
+        if request is None or not request.live:
+            raise HTTPException(409, "request is not pending")
+        row = state.service.get(request.application_id)
+        if row is None:
+            raise HTTPException(404, "unknown application")
+        if not state.authorizer.reject_request(request_id):
+            raise HTTPException(409, "request is not pending")
+        try:
+            skipped = state.service.skip(
+                row.id, reason="skipped by the user from the review queue"
+            )
+        except InvalidTransition as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"skipped": True, "application_id": skipped.id, "state": skipped.state}
+
+    @app.post("/api/requests/{request_id}/allow-company")
+    async def allow_company(request_id: str) -> dict:
+        request = state.authorizer.get_request(request_id)
+        if request is None or not request.live:
+            raise HTTPException(409, "request is not pending")
+        row = state.service.get(request.application_id)
+        if row is None:
+            raise HTTPException(404, "unknown application")
+        policy = state.company_policy.get()
+        company_key = normalize_company(row.company)
+        policy.review_companies = [
+            item for item in policy.review_companies
+            if normalize_company(item) != company_key
+        ]
+        saved = state.company_policy.set(policy)
+        return {"saved": True, "company": row.company, "policy": saved.to_dict()}
 
     @app.post("/api/applications/{application_id}/submit")
     async def submit(application_id: str, body: SubmitBody) -> dict:
@@ -538,6 +621,19 @@ def create_app(
     async def get_preferences() -> dict:
         return state.preferences.get().to_dict()
 
+    @app.get("/api/company-policy")
+    async def get_company_policy() -> dict:
+        return state.company_policy.get().to_dict()
+
+    @app.post("/api/company-policy")
+    async def save_company_policy(body: CompanyPolicyBody) -> dict:
+        policy = CompanyPolicy(
+            default_policy=body.default_policy,
+            review_companies=body.review_companies,
+            never_companies=body.never_companies,
+        )
+        return state.company_policy.set(policy).to_dict()
+
     @app.post("/api/preferences")
     async def save_preferences(body: PreferencesBody) -> dict:
         prefs = JobPreferences(
@@ -583,18 +679,36 @@ def create_app(
     async def runner_status() -> dict:
         policy = state.runner.policy_store.get()
         waiting = state.service.list(ApplicationState.WAITING_FOR_INPUT.value)
+        company_policy = state.company_policy.get()
+        review_waiting = [
+            {
+                "application_id": row.id,
+                "title": row.title,
+                "company": row.company,
+                "reason": "该公司在人工确认名单中，需要你确认",
+            }
+            for row in state.service.list(ApplicationState.WAITING_FOR_APPROVAL.value)
+            if company_policy.decision(row.company).value == "review"
+        ]
         return {
             "paused": state.runner.paused,
             "stopped": state.runner.stopped,
             "policy": policy.to_dict(),
             "policy_usable": policy.usable,
+            "company_policy": company_policy.to_dict(),
+            "review_waiting": review_waiting,
             "waiting_for_input": [
                 {
                     "application_id": row.id,
                     "title": row.title,
                     "missing": _latest_missing(state.service, row.id),
+                    **{
+                        key: view[key]
+                        for key in ("reason_code", "reason_text", "available_actions")
+                    },
                 }
                 for row in waiting
+                for view in [_application_view(row)]
             ],
         }
 

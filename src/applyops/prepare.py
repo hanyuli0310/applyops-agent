@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .browser import BrowserController
+from .company_policy import CompanyDecision, CompanyPolicyStore
 from .filling import fill_application_form, resume_for_fill
 from .platforms.naming import is_drivable_route
 from .resume import ResumeError, ResumeRef, resolve_resume
@@ -74,6 +75,21 @@ async def prepare_application(
     row = service.get(application_id)
     if row is None:
         raise KeyError(f"unknown application {application_id}")
+
+    # Never-listed companies are blocked at the shared prepare boundary too,
+    # so a manual/API/MCP caller cannot bypass the queue runner's policy check.
+    company_policy_store = CompanyPolicyStore(service.data_dir)
+    if (
+        company_policy_store.path.exists()
+        and company_policy_store.get().decision(row.company) is CompanyDecision.NEVER
+    ):
+        detail = f"company {row.company!r} is in the never list"
+        service.skip(application_id, reason=detail)
+        return PrepareOutcome(
+            state=ApplicationState.SKIPPED.value,
+            route=row.route,
+            detail=detail,
+        )
 
     if row.state == ApplicationState.SUBMITTED_UNVERIFIED.value:
         raise PrepareRefused(

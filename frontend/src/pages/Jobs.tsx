@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, Application, Preferences, STATE_LABELS } from "../api";
+import { api, Application, CompanyPolicy, Preferences, STATE_LABELS } from "../api";
 
 export function JobsPage({ onChanged }: { onChanged: () => void }) {
   const [jobs, setJobs] = useState<Application[]>([]);
@@ -16,6 +16,13 @@ export function JobsPage({ onChanged }: { onChanged: () => void }) {
     exclude_companies: [],
   });
   const [preview, setPreview] = useState<{ keep: boolean; reasons: string[] } | null>(null);
+  const [companyPolicy, setCompanyPolicy] = useState<CompanyPolicy>({
+    default_policy: "auto",
+    review_companies: [],
+    never_companies: [],
+  });
+  const [reviewInput, setReviewInput] = useState("");
+  const [neverInput, setNeverInput] = useState("");
 
   const reload = useCallback(() => {
     api.applications().then((r) => setJobs(r.applications));
@@ -24,6 +31,7 @@ export function JobsPage({ onChanged }: { onChanged: () => void }) {
   useEffect(reload, [reload]);
   useEffect(() => {
     api.preferences().then(setPrefs);
+    api.companyPolicy().then(setCompanyPolicy);
   }, []);
 
   const add = async (body: { job_url: string; title?: string; company?: string }) => {
@@ -51,6 +59,36 @@ export function JobsPage({ onChanged }: { onChanged: () => void }) {
     } catch (err) {
       setError(String((err as Error).message ?? err));
     }
+  };
+
+  const saveCompanyPolicy = async () => {
+    setError("");
+    try {
+      const saved = await api.saveCompanyPolicy(companyPolicy);
+      setCompanyPolicy(saved);
+      setMessage("公司投递策略已保存：未列出的公司自动投递。\n");
+      onChanged();
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+    }
+  };
+
+  const addCompany = (kind: "review_companies" | "never_companies") => {
+    const value = (kind === "review_companies" ? reviewInput : neverInput).trim();
+    if (!value) return;
+    setCompanyPolicy({
+      ...companyPolicy,
+      [kind]: [...companyPolicy[kind], value],
+    });
+    if (kind === "review_companies") setReviewInput("");
+    else setNeverInput("");
+  };
+
+  const removeCompany = (kind: "review_companies" | "never_companies", index: number) => {
+    setCompanyPolicy({
+      ...companyPolicy,
+      [kind]: companyPolicy[kind].filter((_value, current) => current !== index),
+    });
   };
 
   const runPreview = async () => {
@@ -183,6 +221,42 @@ export function JobsPage({ onChanged }: { onChanged: () => void }) {
         </div>
       </div>
 
+      <div className="card" data-testid="company-policy">
+        <h3>自动投递公司策略</h3>
+        <p className="hint">
+          未列出的公司自动投递；人工确认名单会自动准备并出现在「待我处理」；永不投递名单会直接跳过。
+        </p>
+        <label>
+          默认策略
+          <select value={companyPolicy.default_policy} disabled>
+            <option value="auto">未列出的公司自动投递</option>
+          </select>
+        </label>
+        <CompanyList
+          title="需要人工确认"
+          values={companyPolicy.review_companies}
+          input={reviewInput}
+          onInput={setReviewInput}
+          onAdd={() => addCompany("review_companies")}
+          onRemove={(index) => removeCompany("review_companies", index)}
+          testId="review-companies"
+        />
+        <CompanyList
+          title="永不投递"
+          values={companyPolicy.never_companies}
+          input={neverInput}
+          onInput={setNeverInput}
+          onAdd={() => addCompany("never_companies")}
+          onRemove={(index) => removeCompany("never_companies", index)}
+          testId="never-companies"
+        />
+        <div className="actions">
+          <button data-testid="company-policy-save" onClick={saveCompanyPolicy}>
+            保存公司策略
+          </button>
+        </div>
+      </div>
+
       <div className="card">
         <h3>队列中（{active.length}）</h3>
         {active.length === 0 && <p>队列为空。添加一个岗位，或点上面的演示按钮。</p>}
@@ -198,6 +272,55 @@ export function JobsPage({ onChanged }: { onChanged: () => void }) {
       {message && <div className="banner ok" data-testid="jobs-message">{message}</div>}
       {error && <div className="banner error">{error}</div>}
     </section>
+  );
+}
+
+function CompanyList({
+  title,
+  values,
+  input,
+  onInput,
+  onAdd,
+  onRemove,
+  testId,
+}: {
+  title: string;
+  values: string[];
+  input: string;
+  onInput: (value: string) => void;
+  onAdd: () => void;
+  onRemove: (index: number) => void;
+  testId: string;
+}) {
+  return (
+    <div className="company-list" data-testid={testId}>
+      <h4>{title}</h4>
+      <div className="chips">
+        {values.map((value, index) => (
+          <span className="pill" key={`${value}-${index}`}>
+            {value}
+            <button
+              type="button"
+              aria-label={`删除 ${value}`}
+              onClick={() => onRemove(index)}
+            >
+              ×
+            </button>
+          </span>
+        ))}
+      </div>
+      <div className="actions">
+        <input
+          value={input}
+          placeholder="输入公司名"
+          onChange={(event) => onInput(event.target.value)}
+          onKeyDown={(event) => event.key === "Enter" && onAdd()}
+        />
+        <button type="button" onClick={onAdd}>
+          + 添加
+        </button>
+      </div>
+    </div>
   );
 }
 

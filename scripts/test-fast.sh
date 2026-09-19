@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+exec .venv/bin/python -m pytest -m "not browser and not slow" -q -p no:cacheprovider "$@"

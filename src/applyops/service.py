@@ -32,6 +32,7 @@ from pathlib import Path
 from .answers import AnswerStore
 from .authorization import SubmissionAuthorizer
 from .browser import BrowserController
+from .company_policy import CompanyDecision, CompanyPolicyStore
 from .guardrails import Guardrails
 from .ledger import ApplicationRow, Ledger
 from .memory import MemoryStore
@@ -223,6 +224,18 @@ class ApplicationService:
         row = self.ledger.get(application_id)
         if row is None:
             raise KeyError(f"unknown application {application_id}")
+
+        # Re-check NEVER at the final boundary as well. A posting may have
+        # entered the review queue before the user added its company to the
+        # never list; that later policy decision must still prevent a send.
+        company_policy_store = CompanyPolicyStore(self.data_dir)
+        if (
+            company_policy_store.path.exists()
+            and company_policy_store.get().decision(row.company) is CompanyDecision.NEVER
+        ):
+            raise SubmissionRefused(
+                f"company {row.company!r} is in the never list; submission refused"
+            )
 
         # Rails first, against the file rather than against memory: quota,
         # spacing, circuit breaker and the duplicate check apply to every
@@ -416,6 +429,15 @@ class ApplicationService:
         # the state machine simply refuses the move from SUBMITTING.
         return self.ledger.transition(
             application_id, ApplicationState.CANCELLED, payload={"reason": reason}
+        )
+
+    def skip(self, application_id: str, *, reason: str = "") -> ApplicationRow:
+        """Record a policy decision that rules a posting out before prepare."""
+        row = self.ledger.get(application_id)
+        if row is None:
+            raise KeyError(f"unknown application {application_id}")
+        return self.ledger.transition(
+            application_id, ApplicationState.SKIPPED, payload={"reason": reason}
         )
 
     def recover(self) -> list[ApplicationRow]:

@@ -52,10 +52,47 @@ export function AttentionPage({ onChanged }: { onChanged: () => void }) {
     }
   };
 
+  const approveAndSubmit = async (request: PendingRequest) => {
+    setError("");
+    try {
+      const approved = await api.approve(request.request_id);
+      const result = await api.submit(request.application_id, approved.grant_id);
+      setMessage(`已批准并提交 ${request.company || request.job_key}：${result.status}`);
+      reload();
+      onChanged();
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+    }
+  };
+
   const reject = async (requestId: string) => {
     await api.reject(requestId);
     reload();
     onChanged();
+  };
+
+  const skipRequest = async (requestId: string) => {
+    setError("");
+    try {
+      await api.skipRequest(requestId);
+      setMessage("已跳过该申请，并记录原因。");
+      reload();
+      onChanged();
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+    }
+  };
+
+  const allowCompany = async (requestId: string) => {
+    setError("");
+    try {
+      const result = await api.allowCompany(requestId);
+      setMessage(`已将 ${result.company} 从人工确认名单移除；之后的新申请会按默认策略处理。`);
+      reload();
+      onChanged();
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+    }
   };
 
   return (
@@ -67,18 +104,28 @@ export function AttentionPage({ onChanged }: { onChanged: () => void }) {
         {requests.length === 0 && <p>没有待批准的提交。</p>}
         {requests.map((r) => (
           <div className="card request" key={r.request_id} data-testid="approval-request">
+            <div className="row">
+              <strong>{r.company || "未记录公司"}</strong>
+              <span className="dim">{r.reason}</span>
+            </div>
             <pre className="summary">{r.summary}</pre>
-            <p className="hint">批准 = 同意把上面列出的内容原样发给对方，无法撤回。</p>
+            <p className="hint">批准 = 同意把上面列出的内容原样发给对方，无法撤回。提交仍走现有安全校验。</p>
             <div className="actions">
               <button
                 className="primary"
-                data-testid="approve-button"
-                onClick={() => approve(r.request_id)}
+                data-testid="approve-submit-button"
+                onClick={() => approveAndSubmit(r)}
               >
-                批准这次提交
+                批准并提交
               </button>
-              <button data-testid="reject-button" onClick={() => reject(r.request_id)}>
-                拒绝
+              <button data-testid="approve-button" onClick={() => approve(r.request_id)}>
+                只批准，稍后提交
+              </button>
+              <button data-testid="skip-request-button" onClick={() => skipRequest(r.request_id)}>
+                跳过
+              </button>
+              <button data-testid="allow-company-button" onClick={() => allowCompany(r.request_id)}>
+                以后允许该公司自动投递
               </button>
             </div>
           </div>
@@ -89,14 +136,15 @@ export function AttentionPage({ onChanged }: { onChanged: () => void }) {
         <h3>等你补充的岗位（{inputNeeded.length}）</h3>
         {inputNeeded.length === 0 && <p>没有缺信息的岗位。</p>}
         {inputNeeded.map((a) => {
-          const missing = runner?.waiting_for_input.find((w) => w.application_id === a.id)?.missing ?? [];
+          const waiting = runner?.waiting_for_input.find((w) => w.application_id === a.id);
+          const missing = waiting?.missing ?? [];
           return (
             <div className="card request" key={a.id} data-testid="needs-input">
               <div className="row">
                 <span className="pill warn">{STATE_LABELS[a.state]}</span>
                 <strong>{a.title || a.job_key}</strong>
               </div>
-              <p className="hint">缺这些信息，所以没有生成待批准请求：</p>
+              <p className="hint">{waiting?.reason_text ?? "需要补充申请信息"}</p>
               <ul data-testid="missing-list">
                 {missing.length === 0 && <li className="dim">（点「重新准备」看看具体缺什么）</li>}
                 {missing.map((m) => (
@@ -158,8 +206,8 @@ export function AttentionPage({ onChanged }: { onChanged: () => void }) {
       <div className="card">
         <h3>批量运行（受监督）</h3>
         <p className="hint">
-          运行一轮 = 恢复中断 → 核实未知结果 → 准备岗位 → <strong>只提交你已经批准过的</strong>。
-          它永远不会自己批准。
+          运行一轮 = 恢复中断 → 核实未知结果 → 按公司策略准备岗位 →
+          普通公司自动提交，人工确认名单停在这里，永不投递名单直接跳过。
         </p>
         <div className="row">
           <span className="pill">{runner?.paused ? "已暂停" : "运行中"}</span>
@@ -168,7 +216,7 @@ export function AttentionPage({ onChanged }: { onChanged: () => void }) {
           </span>
         </div>
         <label>
-          自动模式（仅限已批准的提交，默认关闭）
+          自动运行总开关
           <select
             data-testid="policy-toggle"
             value={policy.enabled ? "on" : "off"}
@@ -179,7 +227,7 @@ export function AttentionPage({ onChanged }: { onChanged: () => void }) {
           </select>
         </label>
         <label>
-          上限（本轮最多自动消耗几个已批准的提交）
+          外层上限（每轮最多提交几份）
           <input
             data-testid="policy-max"
             type="number"

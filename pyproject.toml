@@ -57,6 +57,12 @@ target-version = "py312"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "browser: starts a real browser or drives a browser-backed flow",
+    "slow: takes longer than the fast development loop",
+    "integration: crosses more than one application boundary",
+    "concurrency: exercises process or page concurrency",
+]
 
 # The built console travels with the package. A user who installed ApplyOps
 # should never be told to run npm: `applyops serve` finds the build inside the
