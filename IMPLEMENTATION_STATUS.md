@@ -579,3 +579,83 @@ enough headless Chromes accumulate.
 None known. The MCP demo flow now runs end to end through public tools only
 (enqueue → prepare → answer → prepare → approve → submit → status), and the two
 stores that used to disagree are one.
+
+---
+
+## Wiring the documented intent, and a per-pass budget (round 4)
+
+Two additions on top of `8ca434b`, both asked for directly. `AGENTS.md`'s
+uncommitted change was read (never modified) and its definition brought into the
+system.
+
+### The target-title pool is now part of the system
+
+`AGENTS.md` §12 defines which job titles this project is for — 32 titles in five
+groups, with the line drawn at engineering and applied research in software, AI
+and ML. Nothing read it: the unattended runners searched six hard-coded query
+strings and the console's filter knew only what the user had typed.
+
+- `applyops/target_titles.py` ships the pool (same groups, same order, same
+  wording) plus the search keywords the runners use.
+- **Drift is a test failure, not a surprise.** `from_agents_md` parses the
+  document solely so a test can assert the shipped list still equals it; nothing
+  at runtime reads markdown, because a policy that depends on a prose file
+  sitting next to the installed package breaks the moment the package is
+  installed on its own.
+- Search keywords are a **declared subset, not a generated list**. The pool is
+  semantic; a LinkedIn query is a blunt string. Turning 32 titles into 32 queries
+  would be inventing policy, so the six queries are listed explicitly and a test
+  requires each one to be backed by a title in the pool.
+- `tools/auto_apply.py` now derives `KEYWORDS` from the pool (it used to carry its
+  own copy), and `cron_apply.py` keeps rotating through it.
+- Adoption is one call: `PreferenceStore.seed_target_titles()` and
+  `POST /api/preferences/target-titles/seed`. Additive and idempotent — the
+  user's own titles survive, nothing is duplicated. Once adopted, the pool is
+  what the filter and the preview apply.
+
+### Every pass states how many it will send
+
+A pass used to take its budget from the stored auto-policy, which is set once and
+then silently reused — a number chosen days ago governing tonight's run, and a
+pass with no policy quietly becoming zero rather than a question.
+
+- `run_pass(browser, budget=<n>)` is required. Missing, zero, negative or
+  non-integer raises `PassBudgetRequired`; the API answers 422; the console's
+  button stays disabled until a positive number is entered.
+- The count is **not remembered**: every pass states its own, and the next pass
+  without one is refused.
+- The stored policy remains the **outer gate**. Asking for more than the policy
+  allows is refused rather than silently clamped, and auto mode off (or expired)
+  still means nothing is sent even when a number was typed — the switch is not
+  bypassable by typing.
+- `PassReport` reports `budget` and `budget_remaining`, and the console shows
+  "本轮额度 N · 已投 M · 剩余 …".
+
+### Tests
+
+| file | tests | covers |
+|---|---|---|
+| `tests/test_target_titles.py` | 7 | shipped pool equals `AGENTS.md` §12; the scope the document draws (landmarks in, analyst/finance/PM/QA out); every search keyword is backed by a pool title; the runner derives its keywords; seeding makes the pool filter for real; seeding twice is idempotent and keeps the user's own titles; the console endpoint needs the token and then the preview reflects the pool |
+| `tests/test_pass_budget.py` | 5 | no budget → refused and nothing sent; zero/negative → refused; budget bounds one pass and does not carry over; asking above the policy → refused; the console asks for the number every time |
+
+Existing suites that had to be told the new rule: `tests/test_m4_supervised_automation.py`
+(every pass now states a budget; the policy-bounds test now asserts that asking
+for more than the policy is refused) and one acceptance test (the runner endpoint
+now requires `budget`).
+
+### Results
+
+`test_target_titles.py` 7 passed (exit 0) · `test_pass_budget.py` 5 passed (exit 0) ·
+`test_m4_supervised_automation.py` 13 passed (exit 0) · `test_acceptance_fixes.py`
+25 passed (exit 0) · `test_m1_trusted_execution.py` 40 passed (exit 0) ·
+`test_m2_unified_core.py` 23 passed · `test_m3_local_ui.py` 9 passed ·
+`test_m5_productization.py` 9 passed · `test_core.py` 10 passed ·
+`test_blocker_mcp_flow.py` 3 passed · `test_blocker_mcp_answers.py` 4 passed ·
+`test_blocker_choice_groups.py` 3 passed · `test_blocker_click_phases.py` 6 passed ·
+`test_blocker_reconcile_binding.py` 6 passed · `test_blocker_concurrency.py`
+7 passed (3 batches) · frontend vitest 7 passed, build and tsc clean ·
+`ruff` 134 findings, same as the baseline.
+
+As before, `test_blocker_concurrency.py` and the suite as a whole were not run in
+a single process — the sandbox's memory cap (exit 137) kills them once enough
+headless Chromes accumulate.

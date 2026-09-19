@@ -719,9 +719,15 @@ def test_runner_controls_and_policy_reach_the_real_runner():
         status = client.get("/api/runner/status").json()
         assert status["policy_usable"] is True
 
-        # A pass with the policy on and no approvals submits nothing.
-        report = client.post("/api/runner/pass").json()
+        # A pass must say how many it may send, and with the policy on but no
+        # approvals it submits nothing.
+        refused = client.post("/api/runner/pass", json={})
+        assert refused.status_code == 422, refused.text
+
+        report = client.post("/api/runner/pass", json={"budget": 1}).json()
         assert report["submitted"] == []
+        assert report["budget"] == 1
+        assert report["budget_remaining"] == 1
 
 
 def test_preferences_explain_why_a_posting_is_kept_or_filtered():

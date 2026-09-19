@@ -24,7 +24,7 @@ from applyops.answers import AnswerScope, AnswerStore
 from applyops.authorization import SubmissionAuthorizer
 from applyops.demo_ats import DemoATS, write_sample_resume
 from applyops.ledger import ApplicationRow
-from applyops.runner import AutoPolicy, PolicyStore, QueueRunner
+from applyops.runner import AutoPolicy, PassBudgetRequired, PolicyStore, QueueRunner
 from applyops.service import ApplicationService
 from applyops.state_machine import ApplicationState
 
@@ -229,7 +229,7 @@ async def test_disabled_policy_prepares_but_never_submits():
         await controller.launch()
         try:
             _enqueue_demo(service, ats.url, "job-1")
-            report = await runner.run_pass(controller)
+            report = await runner.run_pass(controller, budget=5)
 
             assert report.submitted == []  # nothing was sent, policy or no policy
             assert len(report.prepared) == 1
@@ -240,7 +240,7 @@ async def test_disabled_policy_prepares_but_never_submits():
             assert row.state == ApplicationState.WAITING_FOR_APPROVAL.value
 
             # And a pass that finds nothing new to prepare does nothing rash.
-            second = await runner.run_pass(controller)
+            second = await runner.run_pass(controller, budget=5)
             assert second.prepared == []
         finally:
             await controller.close()
@@ -259,7 +259,7 @@ async def test_missing_resume_parks_the_application_with_the_reason():
         await controller.launch()
         try:
             _enqueue_demo(service, ats.url, "job-no-resume")
-            report = await runner.run_pass(controller)
+            report = await runner.run_pass(controller, budget=5)
 
             assert report.submitted == []
             assert len(report.parked) == 1
@@ -272,7 +272,11 @@ async def test_missing_resume_parks_the_application_with_the_reason():
 
 @pytest.mark.asyncio
 async def test_policy_bounds_how_many_preapproved_submissions_a_pass_spends():
-    """Two pre-approved jobs, a budget of one: exactly one goes out."""
+    """Two pre-approved jobs: the pass asks for two, the policy allows one.
+
+    The count is chosen for this pass (it always is, now) and the stored policy
+    still clamps it -- asking for more than the policy is refused outright.
+    """
     root = _tmp()
     service = _service_with_resume(root)
     runner = QueueRunner(service, policy_store=PolicyStore(root))
@@ -296,7 +300,7 @@ async def test_policy_bounds_how_many_preapproved_submissions_a_pass_spends():
             ]
 
             # First pass: prepares both, submits nothing (no grants yet).
-            first = await runner.run_pass(controller)
+            first = await runner.run_pass(controller, budget=1)
             assert len(first.prepared) == 2 and first.submitted == []
 
             # The human approves BOTH (a batch review), minting two grants.
@@ -306,11 +310,16 @@ async def test_policy_bounds_how_many_preapproved_submissions_a_pass_spends():
                 )
                 assert grant is not None
 
-            # Second pass: budget of one -- exactly one submission.
-            second = await runner.run_pass(controller)
-            assert len(second.submitted) == 1
+            # Asking for more than the policy allows is refused, not clamped
+            # silently: the operator should hear "no", not get 1 of the 2.
+            with pytest.raises(PassBudgetRequired):
+                await runner.run_pass(controller, budget=2)
+
+            # Second pass: one -- exactly one submission.
+            second = await runner.run_pass(controller, budget=1)
+            assert len(second.submitted) == 1, second.to_dict()
             assert second.submitted[0]["status"] == "verified"
-            assert "policy budget spent" in second.stopped_reason
+            assert "budget spent" in second.stopped_reason
 
             # Third pass: the budget is per policy lifetime; it was spent, and
             # the remaining application is still waiting for its human.
@@ -344,7 +353,7 @@ async def test_policy_platform_allowlist_refuses_outside_platforms():
         await controller.launch()
         try:
             _enqueue_demo(service, ats.url, "job-off-platform")
-            report = await runner.run_pass(controller)
+            report = await runner.run_pass(controller, budget=5)
             assert report.submitted == []
             assert report.prepared == []  # not even prepared: outside the policy
             assert report.refused and "outside the policy" in report.refused[0]["reason"]
@@ -368,13 +377,13 @@ async def test_stop_and_pause_are_honoured_between_applications():
                 _enqueue_demo(service, ats.url, f"job-{i}")
 
             runner.pause()
-            paused_report = await runner.run_pass(controller)
+            paused_report = await runner.run_pass(controller, budget=5)
             assert paused_report.prepared == []
             assert "paused" in paused_report.stopped_reason
 
             runner.resume()
             runner.stop()
-            stopped_report = await runner.run_pass(controller)
+            stopped_report = await runner.run_pass(controller, budget=5)
             assert stopped_report.prepared == []
             assert "stopped" in stopped_report.stopped_reason
         finally:
@@ -400,7 +409,7 @@ async def test_reconciliation_pass_never_submits():
             service.ledger.transition(row.id, ApplicationState.SUBMITTING)
             service.ledger.transition(row.id, ApplicationState.SUBMITTED_UNVERIFIED)
 
-            report = await runner.run_pass(controller)
+            report = await runner.run_pass(controller, budget=5)
             assert len(report.reconciled) == 1
             assert report.submitted == []
             assert (

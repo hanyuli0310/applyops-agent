@@ -42,6 +42,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from applyops.target_titles import search_keywords
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -65,14 +67,12 @@ PENDING_PATH = DATA / "pending_questions.json"
 RESUME_KEY = "resume_path"
 
 # software / ML / agent -- the three families the user named.
-KEYWORDS = [
-    "software engineer",
-    "machine learning engineer",
-    "AI agent engineer",
-    "LLM engineer",
-    "backend engineer",
-    "applied AI engineer",
-]
+# The search queries come from the project's target-title pool (`AGENTS.md` §12,
+# kept in `applyops.target_titles`), not from a list typed here: a second copy is
+# a second source of truth, and the two had already drifted apart. A test requires
+# every keyword to be backed by a title in the pool, so a query cannot outlive the
+# intent it came from.
+KEYWORDS = search_keywords()
 LOCATION = "United States"
 MAX_HOURS = 24.0
 

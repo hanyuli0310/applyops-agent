@@ -217,8 +217,10 @@ export const api = {
   runnerStatus: () => request<RunnerStatus>("/runner/status"),
   runnerControl: (action: "pause" | "resume" | "stop") =>
     request<Record<string, boolean>>(`/runner/${action}`, { method: "POST" }),
-  runnerPass: () =>
+  runnerPass: (budget: number) =>
     request<{
+      budget: number;
+      budget_remaining: number;
       prepared: { application_id: string; request_id: string }[];
       submitted: { application_id: string; status: string }[];
       parked: { application_id: string; reason: string }[];

@@ -9,6 +9,9 @@ export function AttentionPage({ onChanged }: { onChanged: () => void }) {
   const [runner, setRunner] = useState<RunnerStatus | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [passReport, setPassReport] = useState("");
+  // How many this pass may send. Empty on purpose: the number is a decision about
+  // *this* run, so it starts blank rather than inheriting the last one.
+  const [budget, setBudget] = useState("");
   const [policy, setPolicy] = useState({ enabled: false, max_applications: 1, ttl_minutes: 60 });
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -201,16 +204,36 @@ export function AttentionPage({ onChanged }: { onChanged: () => void }) {
           <button data-testid="runner-resume" onClick={async () => { await api.runnerControl("resume"); reload(); }}>
             继续
           </button>
-          <button data-testid="runner-pass" onClick={async () => {
-            const report = await api.runnerPass();
-            setPassReport(
-              `准备 ${report.prepared.length} · 提交 ${report.submitted.length} · 待补 ${report.parked.length}` +
-                (report.stopped_reason ? ` · ${report.stopped_reason}` : "")
-            );
-            reload();
-            onChanged();
-          }}>
-            立即运行一轮
+          <label>
+            这一轮投几份？（每轮都要重新填，不会沿用上次）
+            <input
+              data-testid="pass-budget"
+              type="number"
+              min={1}
+              value={budget}
+              onChange={(e) => setBudget(e.target.value)}
+            />
+          </label>
+          <button
+            data-testid="runner-pass"
+            disabled={!(Number(budget) > 0)}
+            title={Number(budget) > 0 ? "" : "先填这一轮要投几份"}
+            onClick={async () => {
+              try {
+                const report = await api.runnerPass(Number(budget));
+                setPassReport(
+                  `本轮额度 ${report.budget} · 已投 ${report.submitted.length} · 剩余 ${report.budget_remaining}` +
+                    ` · 准备 ${report.prepared.length} · 待补 ${report.parked.length}` +
+                    (report.stopped_reason ? ` · ${report.stopped_reason}` : "")
+                );
+              } catch (err) {
+                setError(String((err as Error).message ?? err));
+              }
+              reload();
+              onChanged();
+            }}
+          >
+            立即运行一轮（{Number(budget) > 0 ? `${budget} 份` : "先填数量"}）
           </button>
         </div>
         {passReport && <div className="banner ok" data-testid="pass-report">{passReport}</div>}

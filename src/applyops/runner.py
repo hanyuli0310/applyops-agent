@@ -96,6 +96,17 @@ class PolicyStore:
 # ── runner ───────────────────────────────────────────────────────────
 
 
+class PassBudgetRequired(ValueError):
+    """A pass was asked to run without saying how many it may send.
+
+    The answer used to come from the stored auto-policy, which is set once and
+    then silently reused -- so a number chosen days ago governed tonight's run,
+    and a pass with no policy at all quietly became a zero rather than a
+    question. The count is a decision about *this* run, so it has to be made for
+    this run.
+    """
+
+
 @dataclass
 class PassReport:
     """What one pass did, item by item. Nothing is summarised into mush."""
@@ -107,6 +118,9 @@ class PassReport:
     parked: list[dict] = field(default_factory=list)
     refused: list[dict] = field(default_factory=list)
     stopped_reason: str = ""
+    #: How many this pass was allowed to send, and how many of those are left.
+    budget: int = 0
+    budget_remaining: int = 0
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -151,8 +165,39 @@ class QueueRunner:
 
     # ── the pass ─────────────────────────────────────────────────────
 
-    async def run_pass(self, controller: BrowserController) -> PassReport:
+    async def run_pass(
+        self, controller: BrowserController, *, budget: int | None = None
+    ) -> PassReport:
+        """One supervised pass, bounded by the count chosen for *this* run.
+
+        `budget` is required: how many submissions this pass may spend. It is not
+        remembered between passes -- every run states its own -- and the stored
+        auto-policy can only tighten it, never replace the decision.
+        """
+        limit = self.policy_store.get()
+        outer = limit.max_applications if limit.usable and limit.max_applications > 0 else None
+
+        if budget is None:
+            raise PassBudgetRequired(
+                "say how many this pass may send (budget=<n>); a pass never "
+                "reuses the previous count"
+            )
+        if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
+            raise PassBudgetRequired(f"budget must be a positive whole number, got {budget!r}")
+        if outer is not None and budget > outer:
+            raise PassBudgetRequired(
+                f"this pass asks for {budget} but the stored auto-policy allows "
+                f"at most {outer}; raise the policy or lower the number"
+            )
+
+        # The number governs *this* pass; the stored policy remains the outer
+        # gate. Auto mode off -- or expired -- still means nothing is sent, even
+        # when a person typed a number: the switch is not bypassable by typing.
+        effective = budget if limit.usable else 0
+
         report = PassReport()
+        report.budget = budget
+        report.budget_remaining = budget
 
         # 1. Books first: crashed submissions become unknowns, never re-runs.
         for row in self.service.recover():
@@ -174,8 +219,7 @@ class QueueRunner:
             )
 
         # 3. Prepare queued work under the policy.
-        policy = self.policy_store.get()
-        budget = policy.max_applications if policy.usable else 0
+        policy = limit
         for row in self.service.list(ApplicationState.QUEUED.value):
             if self._stopped:
                 report.stopped_reason = "stopped by operator"
@@ -220,7 +264,7 @@ class QueueRunner:
 
         # 4. Submit only pre-approved work, within budget -- from this pass's
         #    preparations AND anything still waiting from an earlier one.
-        if budget > 0 and not self._stopped and not self._paused:
+        if effective > 0 and not self._stopped and not self._paused:
             waiting = self.service.list(ApplicationState.WAITING_FOR_APPROVAL.value)
             for row in waiting:
                 if budget <= 0:
@@ -244,12 +288,18 @@ class QueueRunner:
                     )
                     continue
                 budget -= 1
+                report.budget_remaining = max(0, budget)
                 report.submitted.append(
                     {"application_id": row.id, "status": outcome.status}
                 )
 
-        if policy.usable and budget <= 0 and report.submitted:
-            report.stopped_reason = report.stopped_reason or "policy budget spent"
+        if budget <= 0 and report.submitted:
+            report.stopped_reason = report.stopped_reason or "pass budget spent"
+        elif not limit.usable and not report.stopped_reason:
+            report.stopped_reason = "auto policy is off; nothing was submitted"
+            report.budget_remaining = budget
+        else:
+            report.budget_remaining = max(0, budget)
 
         return report
 

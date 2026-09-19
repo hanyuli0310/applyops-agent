@@ -59,6 +59,27 @@ class PreferenceStore:
             atomic_write_json(self.path, prefs.to_dict())
         return prefs
 
+    def seed_target_titles(self) -> JobPreferences:
+        """Add the project's built-in target titles to what the user already has.
+
+        `AGENTS.md` §12 is the written definition of which postings this project
+        is for; adopting it is how that definition starts filtering. The user's
+        own entries are kept and their order preserved, the pool is appended
+        without duplicating anything (case-insensitively), and calling this twice
+        changes nothing the second time.
+        """
+        from .target_titles import all_titles
+
+        prefs = self.get()
+        existing = {title.strip().casefold() for title in prefs.target_titles}
+        merged = list(prefs.target_titles)
+        for title in all_titles():
+            if title.casefold() not in existing:
+                merged.append(title)
+                existing.add(title.casefold())
+        prefs.target_titles = merged
+        return self.set(prefs)
+
 
 def _tokens(text: str) -> set[str]:
     return {t for t in re.split(r"[^a-z0-9+#]+", (text or "").casefold()) if t}

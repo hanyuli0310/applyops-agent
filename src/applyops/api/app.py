@@ -30,7 +30,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..answers import AnswerScope, AnswerStore
 from ..authorization import SubmissionAuthorizer
@@ -47,7 +47,7 @@ from ..preferences import evaluate as evaluate_job
 from ..prepare import PrepareRefused
 from ..prepare import prepare_application as prepare_application_impl
 from ..resume import ResumeError, resolve_resume
-from ..runner import AutoPolicy, QueueRunner
+from ..runner import AutoPolicy, PassBudgetRequired, QueueRunner
 from ..service import ApplicationService
 from ..state_machine import ApplicationState, InvalidTransition
 from ..submission import FinalAction, SubmissionRefused
@@ -102,6 +102,16 @@ class PolicyBody(BaseModel):
     max_applications: int = 0
     allowed_platforms: list[str] = []
     ttl_minutes: int = 60
+
+
+class PassBody(BaseModel):
+    """How many this pass may send.
+
+    Required, and deliberately so: a pass that silently reused the number chosen
+    last time would let a decision days old govern tonight's run.
+    """
+
+    budget: int = Field(gt=0)
 
 
 APP_VERSION = "0.2.0-m3"
@@ -539,6 +549,23 @@ def create_app(
         )
         return state.preferences.set(prefs).to_dict()
 
+    @app.post("/api/preferences/target-titles/seed")
+    async def seed_target_titles() -> dict:
+        """Adopt the built-in target-title pool (AGENTS.md §12) as preferences.
+
+        One call, idempotent, and additive: the user's own titles survive. This is
+        how the written definition of intent becomes something the queue filter
+        actually applies.
+        """
+        from ..target_titles import all_titles
+
+        saved = state.preferences.seed_target_titles()
+        return {
+            "seeded": len(saved.target_titles),
+            "available": len(all_titles()),
+            "target_titles": saved.target_titles,
+        }
+
     @app.post("/api/preferences/preview")
     async def preview_preference(body: PreviewBody) -> dict:
         """Why a posting would be kept or filtered -- the rule, in words."""
@@ -600,11 +627,18 @@ def create_app(
         return policy.to_dict()
 
     @app.post("/api/runner/pass")
-    async def runner_pass() -> dict:
-        """Run one supervised pass now, and report item by item."""
+    async def runner_pass(body: PassBody) -> dict:
+        """Run one supervised pass now, bounded by `budget`, and report item by item.
+
+        `budget` is how many submissions *this* pass may spend. It is not stored
+        and not reused: every run states its own.
+        """
         async with state.page_lock:
             browser = await state.get_browser()
-            report = await state.runner.run_pass(browser)
+            try:
+                report = await state.runner.run_pass(browser, budget=body.budget)
+            except PassBudgetRequired as exc:
+                raise HTTPException(422, str(exc)) from exc
         return report.to_dict()
 
     @app.post("/api/browser/release")
