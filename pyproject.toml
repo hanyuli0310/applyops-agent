@@ -57,3 +57,9 @@ target-version = "py312"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+# The built console travels with the package. A user who installed ApplyOps
+# should never be told to run npm: `applyops serve` finds the build inside the
+# wheel at `applyops/web`.
+[tool.hatch.build.targets.wheel.force-include]
+"frontend/dist" = "applyops/web"

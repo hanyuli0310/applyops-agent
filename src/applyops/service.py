@@ -21,20 +21,24 @@ so a crashed process lands in an honest state instead of a hopeful one.
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from .answers import AnswerStore
 from .authorization import SubmissionAuthorizer
 from .browser import BrowserController
+from .guardrails import Guardrails
 from .ledger import ApplicationRow, Ledger
 from .memory import MemoryStore
 from .resume import ResumeRef
 from .state_machine import ApplicationState, InvalidTransition
 from .submission import (
     FinalAction,
+    SubmissionRefused,
     SubmitOutcome,
     execute_authorized_submission,
     reconcile_submission,
@@ -61,12 +65,44 @@ class ApplicationService:
         memory: MemoryStore | None = None,
         authorizer: SubmissionAuthorizer | None = None,
         ledger: Ledger | None = None,
+        answers: AnswerStore | None = None,
+        guardrails: Guardrails | None = None,
     ):
         self.data_dir = Path(data_dir)
         self.owner = f"svc-{uuid.uuid4().hex[:8]}"
         self.ledger = ledger or Ledger(self.data_dir / "app.sqlite")
         self.memory = memory
         self.authorizer = authorizer or SubmissionAuthorizer(self.data_dir)
+        self.answers = answers or AnswerStore(self.data_dir)
+        self.guardrails = guardrails
+
+    # ── revisions ────────────────────────────────────────────────────
+
+    def revisions(self) -> tuple[str, str]:
+        """(profile_revision, answers_revision) -- one definition, every driver.
+
+        These used to be computed in three places with three meanings, and the
+        M1 grant digest compared values that nobody was actually passing: the UI
+        and the runner sent empty strings, so "the facts changed" was recorded as
+        "nothing changed". A single implementation is the only way the check
+        means anything.
+        """
+        profile_revision = "no-profile"
+        if self.memory is not None:
+            try:
+                text = self.memory.profile.path.read_text(encoding="utf-8")
+                profile_revision = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+            except OSError:
+                profile_revision = "unreadable"
+
+        # Scoped answers *and* the flywheel's learned answers both count: an
+        # answer changing at either layer invalidates approvals based on it.
+        flywheel = ""
+        if self.memory is not None:
+            qa = self.memory.get_all_qa()
+            flywheel = f"{len(qa)}:{max((getattr(q, 'updated_at', '') or '' for q in qa), default='')}"
+        answers_revision = f"{self.answers.revision}:{flywheel}"
+        return profile_revision, answers_revision
 
     # ── enqueue / read ───────────────────────────────────────────────
 
@@ -114,6 +150,7 @@ class ApplicationService:
         *,
         ready: bool,
         detail: str = "",
+        payload: dict | None = None,
     ) -> ApplicationRow:
         """Assemble an attempt: QUEUED or FAILED -> PREPARING -> next state.
 
@@ -125,6 +162,15 @@ class ApplicationService:
         row = self.ledger.get(application_id)
         if row is None:
             raise KeyError(f"unknown application {application_id}")
+
+        # Rails first, against the file rather than against memory: quota,
+        # spacing, circuit breaker and the duplicate check apply to every
+        # driver, or they are not rails at all.
+        if self.guardrails is not None:
+            decision = self.guardrails.preflight(row.job_url, row.job_key)
+            if not decision.allowed:
+                raise SubmissionRefused(decision.reason)
+
         if not self.ledger.claim(application_id, self.owner):
             raise InvalidTransition(ApplicationState(row.state), ApplicationState.PREPARING)
 
@@ -143,7 +189,7 @@ class ApplicationService:
                 else ApplicationState.WAITING_FOR_INPUT
             )
             row = self.ledger.transition(
-                application_id, target, payload={"detail": detail}
+                application_id, target, payload={"detail": detail, **(payload or {})}
             )
         finally:
             if row.state != ApplicationState.WAITING_FOR_APPROVAL.value:
@@ -159,8 +205,6 @@ class ApplicationService:
         resume: ResumeRef,
         action: FinalAction,
         route: str = "",
-        answers_revision: str = "",
-        profile_revision: str = "",
     ) -> SubmitOutcome:
         """Run the authorized submission inside a claim, and record the truth.
 
@@ -172,6 +216,15 @@ class ApplicationService:
         row = self.ledger.get(application_id)
         if row is None:
             raise KeyError(f"unknown application {application_id}")
+
+        # Rails first, against the file rather than against memory: quota,
+        # spacing, circuit breaker and the duplicate check apply to every
+        # driver, or they are not rails at all.
+        if self.guardrails is not None:
+            decision = self.guardrails.preflight(row.job_url, row.job_key)
+            if not decision.allowed:
+                raise SubmissionRefused(decision.reason)
+
         if not self.ledger.claim(application_id, self.owner):
             raise InvalidTransition(
                 ApplicationState(row.state), ApplicationState.SUBMITTING
@@ -193,6 +246,7 @@ class ApplicationService:
                 payload={"grant_id": grant_id, "attempt": attempt.ordinal},
             )
 
+            profile_revision, answers_revision = self.revisions()
             outcome = await execute_authorized_submission(
                 controller=controller,
                 authorizer=self.authorizer,
@@ -203,6 +257,7 @@ class ApplicationService:
                 action=action,
                 answers_revision=answers_revision,
                 profile_revision=profile_revision,
+                application_id=application_id,
             )
 
             target = {
@@ -219,6 +274,7 @@ class ApplicationService:
                 evidence=outcome.evidence,
             )
             self._record_in_memory(row, outcome)
+            self._record_in_rails(outcome)
             return outcome
         except Exception as exc:
             # An exception before any external action is a FAILED attempt. The
@@ -300,6 +356,17 @@ class ApplicationService:
         return result
 
     # ── internals ────────────────────────────────────────────────────
+
+    def _record_in_rails(self, outcome: SubmitOutcome) -> None:
+        """Fold the outcome into quota and the breaker, once, from evidence."""
+        if self.guardrails is None:
+            return
+        if outcome.verified:
+            self.guardrails.record_outcome(success=True)
+        elif outcome.failed:
+            self.guardrails.record_outcome(success=False, note=outcome.detail)
+        else:
+            self.guardrails.record_unverified(note=outcome.detail)
 
     def _record_in_memory(self, row: ApplicationRow, outcome: SubmitOutcome, *, reconcile: bool = False) -> None:
         """Mirror the outcome into the flywheel's history.

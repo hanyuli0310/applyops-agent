@@ -448,19 +448,28 @@ async def resolve_ref(page: Page, ref: str) -> Optional[Locator]:
         return None
 
     if strategy == "label":
-        factories = (
-            lambda f: f.get_by_label(value, exact=False),
-            lambda f: f.get_by_role("radio", name=value, exact=False),
-            lambda f: f.get_by_role("checkbox", name=value, exact=False),
-        )
-        for factory in factories:
-            for frame in await _frames(page):
-                try:
-                    locator = factory(frame)
-                    if await locator.count():
-                        return locator.first
-                except Exception:
-                    continue
+        # Exact first, substring second -- and the order is the whole point.
+        # A field labelled "No" (a yes/no radio) used to resolve to the field
+        # labelled "Notice period", because substring matching found "No" inside
+        # "Notice". That is not a cosmetic bug: the click landed on the wrong
+        # control, and the read-back then "could not verify" a value that was
+        # never typed where we thought.
+        def factories(exact: bool):
+            return (
+                lambda f: f.get_by_label(value, exact=exact),
+                lambda f: f.get_by_role("radio", name=value, exact=exact),
+                lambda f: f.get_by_role("checkbox", name=value, exact=exact),
+            )
+
+        for exact in (True, False):
+            for factory in factories(exact):
+                for frame in await _frames(page):
+                    try:
+                        locator = factory(frame)
+                        if await locator.count():
+                            return locator.first
+                    except Exception:  # noqa: BLE001 - try the next strategy
+                        continue
         # Nothing carried that accessible name. Fall back to the visible text
         # itself -- clicking a label toggles the control it belongs to, which is
         # enough for choosing a resume or agreeing to a term.

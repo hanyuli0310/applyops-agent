@@ -7,6 +7,14 @@
   </head>
   <body>
     <div id="root"></div>
+    <!-- The server replaces this placeholder with a per-process session token.
+         A page opened from file:// or another origin has no token, so it cannot
+         approve anything. -->
+    <script>
+      // The server substitutes the placeholder below (and only it), leaving this
+      // property name intact.
+      window.__APPLYOPS_TOKEN__ = "__APPLYOPS_SESSION_TOKEN__";
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

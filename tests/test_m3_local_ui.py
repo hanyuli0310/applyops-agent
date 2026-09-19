@@ -32,32 +32,78 @@ def _tmp() -> Path:
     return Path(tempfile.mkdtemp(prefix="applyops-m3-"))
 
 
+SYNTHETIC_PROFILE = {
+    "name": "Jane Doe",
+    "email": "jane@example.com",
+    "phone": "+1 555 010 4477",
+    "years_experience": "4",
+    "requires_sponsorship": "no",
+}
+
+
 def _client(headless: bool = True, frontend: Path | None = None):
     """A client whose lifespan RUNS -- otherwise the app's browser is never
-    closed, and a few tests in a row can exhaust the machine."""
+    closed, and a few tests in a row can exhaust the machine.
+
+    It also carries the session token, exactly as the served console page does;
+    without it every state-changing request is refused, which is the point of
+    the token and would make these tests measure the wrong thing.
+    """
     root = _tmp()
     app = create_app(root, frontend_dist=frontend, headless=headless)
-    return TestClient(app), root
+    client = TestClient(app, base_url="http://127.0.0.1")
+    client.headers.update({"X-ApplyOps-Token": app.state.applyops.session_token})
+    return client, root
 
 
 @pytest.fixture
 def client():
+    """A console client with a fillable profile, like a returning user's."""
     client, root = _client(frontend=None)
     with client:
+        client.post("/api/profile", json=dict(SYNTHETIC_PROFILE))
+        client.post(
+            "/api/resumes",
+            files={
+                "file": (
+                    "resume.pdf",
+                    write_sample_resume(root / "resume.pdf").read_bytes(),
+                    "application/pdf",
+                )
+            },
+        )
         yield client, root
+
+
+def _approve_and_submit(client, app_id: str) -> dict:
+    """Walk prepare -> (answer) -> approve -> submit, as the console does."""
+    prepared = client.post(f"/api/applications/{app_id}/prepare").json()
+    if prepared["state"] == "waiting_for_input":
+        client.post(
+            f"/api/applications/{app_id}/answer",
+            json={"question": prepared["missing"][0], "answer": "Two weeks"},
+        )
+        prepared = client.post(f"/api/applications/{app_id}/prepare").json()
+    assert prepared["state"] == "waiting_for_approval", prepared
+    approved = client.post(f"/api/requests/{prepared['request_id']}/approve").json()
+    return client.post(
+        f"/api/applications/{app_id}/submit", json={"grant_id": approved["grant_id"]}
+    ).json()
 
 
 # ── A. API contract ──────────────────────────────────────────────────
 
 
-def test_status_reports_setup_honestly(client):
-    client, _ = client
-    res = client.get("/api/status")
-    assert res.status_code == 200
-    body = res.json()
-    assert body["profile_ready"] is False  # nothing configured yet
-    assert body["missing_required"]  # and it says exactly what is missing
-    assert body["browser_open"] is False
+def test_status_reports_setup_honestly():
+    """A fresh install: nothing configured, and the gaps are listed."""
+    client, _root = _client()
+    with client:
+        res = client.get("/api/status")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["profile_ready"] is False  # nothing configured yet
+        assert body["missing_required"]  # and it says exactly what is missing
+        assert body["browser_open"] is False
 
 
 def test_profile_round_trip(client):
@@ -106,21 +152,12 @@ def test_resume_upload_rejects_unsupported_types(client):
 
 
 def test_demo_flow_to_approval_through_the_api(client):
-    """enqueue -> prepare -> pending request -> approve -> grant exists.
+    """enqueue -> fill -> pending request -> approve -> grant exists.
 
     This is the boundary in UI form: `POST /requests/{id}/approve` is the one
     place a grant can be born, and it is only reachable by the human clicking.
     """
-    client, root = client
-    write_sample_resume(root / "resume.pdf")
-    client.post(
-        "/api/profile",
-        json={"name": "Jane Doe", "email": "jane@example.com"},
-    )
-    client.post(
-        "/api/resumes",
-        files={"file": ("resume.pdf", Path(root / "resume.pdf").read_bytes(), "application/pdf")},
-    )
+    client, _root = client
 
     enqueued = client.post("/api/applications", json={"job_url": ""})
     assert enqueued.status_code == 422  # a URL is required; nothing is guessed
@@ -128,8 +165,15 @@ def test_demo_flow_to_approval_through_the_api(client):
     demo = client.post("/api/demo/start").json()
     app_id = demo["application"]["id"]
 
-    prepared = client.post(f"/api/applications/{app_id}/prepare").json()
-    assert prepared["state"] == "waiting_for_approval"
+    first = client.post(f"/api/applications/{app_id}/prepare").json()
+    if first["state"] == "waiting_for_input":
+        client.post(
+            f"/api/applications/{app_id}/answer",
+            json={"question": first["missing"][0], "answer": "Two weeks"},
+        )
+        first = client.post(f"/api/applications/{app_id}/prepare").json()
+    prepared = first
+    assert prepared["state"] == "waiting_for_approval", prepared
     assert prepared["request_id"]
 
     requests = client.get("/api/requests").json()
@@ -148,19 +192,19 @@ def test_demo_flow_to_approval_through_the_api(client):
 
 
 def test_submit_without_approval_is_refused_by_the_api(client):
-    client, root = client
-    write_sample_resume(root / "resume.pdf")
-    client.post("/api/profile", json={"name": "Jane Doe"})
-    client.post(
-        "/api/resumes",
-        files={"file": ("resume.pdf", (root / "resume.pdf").read_bytes(), "application/pdf")},
-    )
+    client, _root = client
     demo = client.post("/api/demo/start").json()
     app_id = demo["application"]["id"]
 
-    # Prepare opens the real demo form and files the request -- but nobody
-    # approves. The grant id here is fabricated.
-    client.post(f"/api/applications/{app_id}/prepare")
+    # Prepare opens the real demo form, fills it and files the request -- but
+    # nobody approves. The grant id here is fabricated.
+    first = client.post(f"/api/applications/{app_id}/prepare").json()
+    if first["state"] == "waiting_for_input":
+        client.post(
+            f"/api/applications/{app_id}/answer",
+            json={"question": first["missing"][0], "answer": "Two weeks"},
+        )
+        client.post(f"/api/applications/{app_id}/prepare")
     res = client.post(f"/api/applications/{app_id}/submit", json={"grant_id": "made-up"})
     assert res.status_code == 403
 
@@ -188,7 +232,12 @@ def _free_port() -> int:
 async def test_four_pages_end_to_end_in_a_real_browser():
     """The M3 acceptance path, on the built frontend:
 
-    upload resume -> demo job -> prepare -> approve -> submit -> verified.
+    upload resume -> demo job -> prepare (which fills) -> answer what is
+    missing -> prepare again -> approve -> submit -> verified.
+
+    The step that matters most here is the middle one: the summary a person
+    approves must contain the values that were actually filled in, because
+    approving an empty form was the bug this milestone had to fix.
     """
     import uvicorn
     from playwright.async_api import async_playwright
@@ -212,9 +261,12 @@ async def test_four_pages_end_to_end_in_a_real_browser():
 
     base = f"http://127.0.0.1:{port}"
     try:
-        # Seed the profile the way a user's earlier session would have.
-        client = TestClient(app)
-        client.post("/api/profile", json={"name": "Jane Doe", "email": "jane@example.com"})
+        # Seed the profile the way a user's earlier session would have. The API
+        # wants the page's session token for state changes; the browser below
+        # gets it from the served HTML.
+        client = TestClient(app, base_url="http://127.0.0.1")
+        client.headers.update({"X-ApplyOps-Token": app.state.applyops.session_token})
+        client.post("/api/profile", json=dict(SYNTHETIC_PROFILE))
         payload = write_sample_resume(root / "resume.pdf").read_bytes()
         client.post("/api/resumes", files={"file": ("resume.pdf", payload, "application/pdf")})
 
@@ -232,17 +284,34 @@ async def test_four_pages_end_to_end_in_a_real_browser():
             await page.click("[data-testid=demo-start]")
             await page.wait_for_selector("text=演示岗位已入队")
 
-            # 3. 运行与记录: prepare the application.
+            # 3. 运行与记录: prepare. The form gets filled; whatever cannot be
+            #    filled is named instead of being approved as a blank.
             await page.click("text=运行与记录")
             await page.wait_for_selector("[data-testid^=run-]")
             await page.click("[data-testid^=run-]")
-            await page.wait_for_selector("text=等待你在「待我处理」页批准")
+            await page.wait_for_selector("[data-testid=run-message]")
+            first = await page.text_content("[data-testid=run-message]")
+            assert first and "缺" in first, first  # e.g. the notice period
 
-            # 4. 待我处理: read the summary, approve it.
+            # 4. 待我处理: the missing field is listed, answer it, prepare again.
             await page.click("text=待我处理")
+            await page.wait_for_selector("[data-testid=needs-input]")
+            missing_text = await page.text_content("[data-testid=missing-list]")
+            assert "Notice" in missing_text or "notice" in missing_text, missing_text
+
+            app_row = await page.get_attribute("[data-testid=needs-input] input", "data-testid")
+            assert app_row and app_row.startswith("answer-")
+            application_id = app_row.removeprefix("answer-")
+            await page.fill(f"[data-testid=answer-{application_id}]", "Two weeks")
+            await page.click(f"[data-testid=save-answer-{application_id}]")
+            await page.wait_for_selector("[data-testid=attention-message]")
+            await page.click(f"[data-testid=reprepare-{application_id}]")
             await page.wait_for_selector("[data-testid=approval-request]")
+
+            # The approval summary must contain the real values now.
             summary = await page.text_content("[data-testid=approval-request] pre.summary")
-            assert summary and "Jane Doe" not in summary  # the form was empty when read
+            assert "Jane Doe" in summary, summary
+            assert "jane@example.com" in summary, summary
             await page.click("[data-testid=approve-button]")
 
             # Back to runs; submit; expect the verified verdict.

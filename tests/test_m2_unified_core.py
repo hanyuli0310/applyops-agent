@@ -24,7 +24,9 @@ from pathlib import Path
 import pytest
 
 from applyops.demo_ats import DemoATS, write_sample_resume
+from applyops.filling import fill_application_form
 from applyops.ledger import ApplicationRow, Ledger
+from applyops.memory import MemoryStore
 from applyops.resume import resolve_resume
 from applyops.service import ApplicationService
 from applyops.state_machine import (
@@ -42,7 +44,10 @@ def _tmp() -> Path:
 
 
 def _service(data_dir: Path | None = None, **kwargs) -> ApplicationService:
-    return ApplicationService(data_dir or _tmp(), **kwargs)
+    """A service with a real memory store: the filler and the rails need one."""
+    root = data_dir or _tmp()
+    kwargs.setdefault("memory", MemoryStore(root / "memory.json"))
+    return ApplicationService(root, **kwargs)
 
 
 def _enqueue(service: ApplicationService, job_key: str = "job-1") -> ApplicationRow:
@@ -378,8 +383,10 @@ def test_legacy_import_failure_leaves_the_source_untouched():
 
 
 def test_migration_fresh_data_root_imports_nothing():
+    # Deliberately no memory store: the point is a data dir with no history file
+    # at all, which is the state a brand-new install is in.
     root = _tmp()
-    service = _service(root)
+    service = ApplicationService(root)
     assert service.import_legacy_history() == {
         "imported": 0, "skipped": 0, "backup": ""
     }
@@ -406,27 +413,48 @@ async def test_service_drives_one_verified_submission_end_to_end():
             row = service.prepare(row.id, ready=False, detail="form not answered yet")
             assert row.state == ApplicationState.WAITING_FOR_INPUT.value
 
-            # Answer and re-prepare; now it is ready for approval.
+            # Answer the one thing nothing knows, then fill the form the way the
+            # console does -- fill, read back, attach, read back.
+            service.memory.update_profile(
+                {
+                    "name": "Jane Doe",
+                    "email": "jane@example.com",
+                    "phone": "+1 555 010 4477",
+                    "years_experience": "4",
+                    "requires_sponsorship": "no",
+                }
+            )
             await controller.goto(f"{ats.url}/form", settle=0.4)
-            state = await controller.get_page_state()
-            refs = {f.label: f.ref for f in state.form_fields}
-            await controller.fill_field(refs["Full name"], "Jane Doe")
-            await controller.select_option(refs["Notice period"], "Two weeks")
+            service.answers.set_answer("Notice period", "Two weeks")
+            report = await fill_application_form(
+                controller,
+                memory=service.memory,
+                answers=service.answers,
+                resume=resolve_resume(str(write_sample_resume(root / "resume.pdf"))),
+                application_id=row.id,
+            )
+            assert report.ready, report.to_dict()
 
-            row = service.prepare(row.id, ready=True, detail="form answered")
+            row = service.prepare(row.id, ready=True, detail="form filled and verified")
             assert row.state == ApplicationState.WAITING_FOR_APPROVAL.value
 
-            # Approval flows through the request -> human -> grant split.
+            # Approval flows through the request -> human -> grant split, with
+            # the same revisions every real driver uses.
             snapshot = await controller.field_snapshot()
-            resume = write_sample_resume(root / "resume.pdf")
+            resume = resolve_resume(str(root / "resume.pdf"))
+            profile_revision, answers_revision = service.revisions()
             request = service.authorizer.create_request(
                 job_key=row.job_key,
                 job_url=row.job_url,
                 route=row.route,
                 platform=row.platform,
                 fields=snapshot,
-                resume_filename=resume.name,
-                resume_sha256=resolve_resume(str(resume)).sha256,
+                resume_filename=resume.filename,
+                resume_sha256=resume.sha256,
+                answers_revision=answers_revision,
+                profile_revision=profile_revision,
+                application_id=row.id,
+                page_url=controller.page.url,
                 requested_by="service_test",
             )
             grant = service.authorizer.approve_request(
@@ -442,10 +470,10 @@ async def test_service_drives_one_verified_submission_end_to_end():
                 row.id,
                 grant_id=grant.grant_id,
                 controller=controller,
-                resume=resolve_resume(str(resume)),
+                resume=resume,
                 action=action,
             )
-            assert outcome.status == "verified"
+            assert outcome.status == "verified", outcome.to_dict()
 
             row = service.get(row.id)
             assert row.state == ApplicationState.SUBMITTED_VERIFIED.value

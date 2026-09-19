@@ -51,6 +51,55 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+#: Query parameters that identify *the visit*, not the posting.
+TRACKING_PARAMS = frozenset(
+    {
+        "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "tracking", "trackingid", "trk", "trkinfo", "ref", "referrer", "src",
+        "source", "gh_src", "gclid", "fbclid", "sessionid", "sid", "cid",
+        "_ga", "campaign", "recommended", "pipelineid", "from",
+    }
+)
+
+
+def page_identity_of(url: str) -> str:
+    """A canonical identity for "which page is the browser actually on".
+
+    Comparing field snapshots is not enough: two postings served by the same ATS
+    render *identical* forms, so a snapshot taken for job A validates perfectly
+    while the browser sits on job B's page. Only the URL distinguishes them.
+
+    Canonicalisation is the delicate part, and both directions of error matter:
+
+    - **Too strict** (keeping `?utm_source=…`, the fragment, a trailing slash)
+      invalidates legitimate approvals, and the user is asked to approve again
+      for no reason.
+    - **Too loose** (dropping every query parameter) makes two different
+      postings on one route identical -- for example `/form?jobId=1` and
+      `/form?jobId=2` -- which is exactly the confusion this check exists to
+      prevent.
+
+    So: host + path are kept, tracking parameters are dropped, and every other
+    parameter is kept in sorted order because it is part of the posting's
+    identity until proven otherwise.
+    """
+    from urllib.parse import parse_qsl, urlparse
+
+    parsed = urlparse((url or "").strip())
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "/").rstrip("/") or "/"
+    kept = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.casefold() not in TRACKING_PARAMS
+    ]
+    query = "&".join(f"{key}={value}" for key, value in sorted(kept))
+    identity = f"{host}{path}"
+    if query:
+        identity = f"{identity}?{query}"
+    return identity.casefold()
+
+
 def snapshot_digest(
     *,
     fields: dict[str, str],
@@ -97,6 +146,8 @@ class SubmissionRequest:
     job_url: str
     route: str
     platform: str
+    application_id: str = ""
+    page_identity: str = ""
     fields: dict[str, str] = field(default_factory=dict)
     resume_filename: str = ""
     resume_sha256: str = ""
@@ -122,6 +173,8 @@ class SubmissionRequest:
             "request_id": self.request_id,
             "job_key": self.job_key,
             "job_url": self.job_url,
+            "application_id": self.application_id,
+            "page_identity": self.page_identity,
             "route": self.route,
             "platform": self.platform,
             "fields": dict(self.fields),
@@ -177,6 +230,8 @@ class SubmissionGrant:
     job_url: str
     route: str
     platform: str
+    application_id: str = ""
+    page_identity: str = ""
     fields: dict[str, str] = field(default_factory=dict)
     resume_filename: str = ""
     resume_sha256: str = ""
@@ -203,6 +258,8 @@ class SubmissionGrant:
             "grant_id": self.grant_id,
             "job_key": self.job_key,
             "job_url": self.job_url,
+            "application_id": self.application_id,
+            "page_identity": self.page_identity,
             "route": self.route,
             "platform": self.platform,
             "fields": dict(self.fields),
@@ -291,6 +348,8 @@ class SubmissionAuthorizer:
         route: str,
         platform: str,
         fields: dict[str, str],
+        application_id: str = "",
+        page_url: str = "",
         resume_filename: str = "",
         resume_sha256: str = "",
         answers_revision: str = "",
@@ -304,6 +363,10 @@ class SubmissionAuthorizer:
             job_url=job_url,
             route=route,
             platform=platform,
+            application_id=application_id,
+            # Recorded from the page the values were actually read off. This is
+            # the only way to prove later that the browser is still there.
+            page_identity=page_identity_of(page_url or job_url),
             fields=dict(fields),
             resume_filename=resume_filename,
             resume_sha256=resume_sha256,
@@ -338,6 +401,8 @@ class SubmissionAuthorizer:
                 job_url=request.job_url,
                 route=request.route,
                 platform=request.platform,
+                application_id=request.application_id,
+                page_identity=request.page_identity,
                 fields=dict(request.fields),
                 resume_filename=request.resume_filename,
                 resume_sha256=request.resume_sha256,
@@ -443,6 +508,8 @@ class SubmissionAuthorizer:
         answers_revision: str,
         profile_revision: str,
         route: str,
+        application_id: str = "",
+        page_url: str = "",
     ) -> GrantVerdict:
         """Does this grant authorize submitting *what the page holds right now*?
 
@@ -468,6 +535,33 @@ class SubmissionAuthorizer:
                 f"grant was issued for job {grant.job_key!r}, not {job_key!r}",
                 grant,
             )
+
+        # Identity checks come before the value comparison: a grant for another
+        # application must not be satisfiable by "the form happens to look the
+        # same", which is exactly what happens between two postings on one ATS.
+        if application_id and grant.application_id and grant.application_id != application_id:
+            return GrantVerdict(
+                False,
+                (
+                    f"grant belongs to application {grant.application_id[:8]}..., not "
+                    f"{application_id[:8]}... -- approvals are not transferable "
+                    "between applications"
+                ),
+                grant,
+            )
+
+        if page_url:
+            live_identity = page_identity_of(page_url)
+            if live_identity != grant.page_identity:
+                return GrantVerdict(
+                    False,
+                    (
+                        f"the browser is on {live_identity!r}, but this grant was "
+                        f"approved for {grant.page_identity!r}. Submit from the page "
+                        "the approval was read from."
+                    ),
+                    grant,
+                )
 
         observed = snapshot_digest(
             fields=fields,

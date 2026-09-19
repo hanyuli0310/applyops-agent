@@ -117,6 +117,7 @@ async def execute_authorized_submission(
     action: FinalAction,
     answers_revision: str = "",
     profile_revision: str = "",
+    application_id: str = "",
     route_supported: bool = True,
     evidence_timeout: float = DEFAULT_EVIDENCE_TIMEOUT,
 ) -> SubmitOutcome:
@@ -138,6 +139,8 @@ async def execute_authorized_submission(
         raise SubmissionRefused(decision.reason, manual_required=True)
 
     snapshot = await controller.field_snapshot()
+    # `page_url` is what makes "the browser is on the right posting" checkable.
+    # Values alone cannot do it: two postings on one ATS render identical forms.
     verdict = authorizer.verify(
         grant_id,
         job_key=job_key,
@@ -146,13 +149,17 @@ async def execute_authorized_submission(
         answers_revision=answers_revision,
         profile_revision=profile_revision,
         route=route,
+        application_id=application_id,
+        page_url=controller.page.url,
     )
     if not verdict.ok:
         # Snapshot drift is not a refusal to authorize -- it is the news that the
         # authorization stopped applying. Reporting it as a distinct "nothing was
         # sent" outcome rather than throwing keeps the distinction visible: nobody
         # tried to submit anything, and the caller should re-review and re-ask.
-        if verdict.grant is not None and "no longer matches" in verdict.reason:
+        if verdict.grant is not None and (
+            "no longer matches" in verdict.reason or "browser is on" in verdict.reason
+        ):
             return SubmitOutcome(
                 status=STATUS_FAILED,
                 job_key=job_key,

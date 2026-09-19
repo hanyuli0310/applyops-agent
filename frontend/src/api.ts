@@ -1,9 +1,24 @@
 const BASE = "/api";
 
+/**
+ * The session token the server baked into this page.
+ *
+ * State-changing requests carry it, which is what distinguishes a click in this
+ * console from a form post by some other page the user happens to have open.
+ */
+function sessionToken(): string {
+  return (window as unknown as { __APPLYOPS_TOKEN__?: string }).__APPLYOPS_TOKEN__ ?? "";
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const method = (options?.method ?? "GET").toUpperCase();
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (method !== "GET" && method !== "HEAD") {
+    headers["X-ApplyOps-Token"] = sessionToken();
+  }
   const res = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
     ...options,
+    headers: { ...headers, ...(options?.headers as Record<string, string> | undefined) },
   });
   if (!res.ok) {
     let detail = res.statusText;
@@ -55,8 +70,44 @@ export interface PendingRequest {
   request_id: string;
   job_key: string;
   job_url: string;
+  application_id: string;
   created_at: string;
   summary: string;
+}
+
+export interface FillOutcome {
+  label: string;
+  ref: string;
+  source: string;
+  verification: string;
+  detail: string;
+}
+
+export interface FillReport {
+  ready: boolean;
+  filled: FillOutcome[];
+  unfilled_required: string[];
+  unfilled_optional: string[];
+  unreadable: string[];
+  mismatched: FillOutcome[];
+  resume: FillOutcome | null;
+  problems: string[];
+}
+
+export interface RunnerStatus {
+  paused: boolean;
+  stopped: boolean;
+  policy_usable: boolean;
+  policy: { enabled: boolean; max_applications: number; allowed_platforms: string[] };
+  waiting_for_input: { application_id: string; title: string; missing: string[] }[];
+}
+
+export interface Preferences {
+  target_titles: string[];
+  locations: string[];
+  include_keywords: string[];
+  exclude_keywords: string[];
+  exclude_companies: string[];
 }
 
 export interface ProfileData {
@@ -84,7 +135,11 @@ export const api = {
   uploadResume: (file: File) => {
     const body = new FormData();
     body.append("file", file);
-    return fetch(`${BASE}/resumes`, { method: "POST", body }).then((res) => {
+    return fetch(`${BASE}/resumes`, {
+      method: "POST",
+      body,
+      headers: { "X-ApplyOps-Token": sessionToken() },
+    }).then((res) => {
       if (!res.ok) throw new Error(`上传失败 (${res.status})`);
       return res.json();
     });
@@ -105,10 +160,13 @@ export const api = {
   cancel: (id: string) =>
     request<{ cancelled: boolean }>(`/applications/${id}/cancel`, { method: "POST" }),
   prepare: (id: string) =>
-    request<{ state: string; request_id?: string; blocked?: string; detail?: string }>(
-      `/applications/${id}/prepare`,
-      { method: "POST" }
-    ),
+    request<{
+      state: string;
+      request_id?: string;
+      missing?: string[];
+      detail?: string;
+      fill_report?: FillReport;
+    }>(`/applications/${id}/prepare`, { method: "POST" }),
   submit: (id: string, grantId: string) =>
     request<{ status: string; detail: string; evidence: Record<string, unknown> }>(
       `/applications/${id}/submit`,
@@ -120,13 +178,60 @@ export const api = {
     }),
   pendingRequests: () => request<{ count: number; requests: PendingRequest[] }>("/requests"),
   approve: (requestId: string) =>
-    request<{ approved: boolean; grant_id: string }>(`/requests/${requestId}/approve`, {
-      method: "POST",
-    }),
+    request<{ approved: boolean; grant_id: string; application_id: string; job_key: string }>(
+      `/requests/${requestId}/approve`,
+      { method: "POST" }
+    ),
   reject: (requestId: string) =>
     request<{ rejected: boolean }>(`/requests/${requestId}/reject`, { method: "POST" }),
   startDemo: () =>
     request<{ application: Application; demo_url: string }>("/demo/start", { method: "POST" }),
+
+  // ── scoped answers ──
+  answers: () =>
+    request<{ count: number; revision: string; answers: Record<string, string>[] }>("/answers"),
+  saveAnswer: (body: {
+    question: string;
+    answer: string;
+    scope?: string;
+    company?: string;
+    application_id?: string;
+  }) => request<{ saved: boolean }>("/answers", { method: "POST", body: JSON.stringify(body) }),
+  answerForApplication: (id: string, question: string, answer: string) =>
+    request<{ saved: boolean }>(`/applications/${id}/answer`, {
+      method: "POST",
+      body: JSON.stringify({ question, answer }),
+    }),
+
+  // ── preferences ──
+  preferences: () => request<Preferences>("/preferences"),
+  savePreferences: (prefs: Preferences) =>
+    request<Preferences>("/preferences", { method: "POST", body: JSON.stringify(prefs) }),
+  previewPreference: (body: { title: string; company?: string; location?: string }) =>
+    request<{ title: string; keep: boolean; reasons: string[] }>("/preferences/preview", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  // ── runner ──
+  runnerStatus: () => request<RunnerStatus>("/runner/status"),
+  runnerControl: (action: "pause" | "resume" | "stop") =>
+    request<Record<string, boolean>>(`/runner/${action}`, { method: "POST" }),
+  runnerPass: () =>
+    request<{
+      prepared: { application_id: string; request_id: string }[];
+      submitted: { application_id: string; status: string }[];
+      parked: { application_id: string; reason: string }[];
+      refused: { application_id: string; reason: string }[];
+      stopped_reason: string;
+    }>("/runner/pass", { method: "POST" }),
+  setPolicy: (body: {
+    enabled: boolean;
+    max_applications: number;
+    allowed_platforms: string[];
+    ttl_minutes: number;
+  }) => request<Record<string, unknown>>("/runner/policy", { method: "POST", body: JSON.stringify(body) }),
+  releaseBrowser: () => request<{ closed: boolean }>("/browser/release", { method: "POST" }),
 };
 
 export const STATE_LABELS: Record<string, string> = {

@@ -351,3 +351,70 @@ demo → prepare → approve → submit → verified → history.
 
 Final verification, known limitations, unsupported routes and beta checklist
 are consolidated in `FINAL_REPORT.md`.
+
+---
+
+## Acceptance review fixes (post-M5)
+
+**Status: COMPLETE. All suites pass. Not committed, not pushed -- left in the
+working tree for review.**
+
+Nine reported problems, each fixed and each covered by a regression test in
+`tests/test_acceptance_fixes.py` (25 tests). Every one of these was a real
+defect in shipped code, confirmed by reading the failure, not by inspection.
+
+| # | problem | fix | tests |
+|---|---|---|---|
+| 1 | `request_submission_grant` called `create_request(source=...)`; the parameter is `requested_by` -- the MCP flow raised TypeError and could never run | parameter corrected; `application_id` + `page_url` now passed; `applyops approve <request_id>` added as a real subcommand of the console script | `test_mcp_request_grant_is_callable_and_the_approve_channel_exists`, `test_approve_refuses_to_decide_non_interactively` |
+| 2 | Web `prepare` read an *empty* form and asked approval for it; the demo ATS accepted anything | new `filling.py`: fill from profile -> scoped answers -> verify each read-back -> attach resume -> verify attachment; unresolved/unreadable/mismatched fields park the application in `waiting_for_input`; demo ATS parses the multipart body and validates required fields + resume | `test_prepare_fills_the_form_and_the_ats_receives_jane_doe`, `test_demo_ats_rejects_an_empty_or_partial_application` |
+| 3 | The UI took "the first grant it found in localStorage" | `frontend/src/grants.ts` keys grants by application id; API returns `application_id` on approve; three consecutive applications each use their own grant | `test_three_applications_each_submit_with_their_own_grant`, `test_wrong_grant_for_the_wrong_application_is_refused`, `test_expired_and_used_grants_are_both_refused`, frontend `grants.test.ts` (7) |
+| 4 | Submitting compared field snapshots only; two postings on one ATS render identical forms | `page_identity_of()` (host+path+non-tracking query, tracking params dropped) recorded at approval; checked again at submit; `application_id` non-transferable | `test_grant_refuses_when_the_browser_sits_on_another_posting`, `test_submit_refuses_when_the_browser_moved_to_another_application`, `test_page_identity_ignores_noise_and_keeps_the_posting` |
+| 5 | Web/MCP/runner had three submission paths; `submit_application(outcome="verified")` let a caller type a success | MCP `submit_final` goes through `ApplicationService`; `submit_application` is now a read-only view of the ledger attempt; `service.submit` runs preflight, claims, and records rails + history | `test_submit_application_reports_evidence_and_cannot_invent_a_verdict`, `test_service_applies_the_rails_for_every_driver` |
+| 6 | The FastAPI browser owner ignored the cross-process profile lock | `AppState` takes `FileLock(browser_lock_path(...))`, refuses with the holder's name, releases on close (`/api/browser/release`) | `test_the_console_profile_lock_is_held_across_processes` (child process) |
+| 7 | `profile_revision` / `answers_revision` were empty strings from the UI and runner, so "the facts changed" was recorded as "nothing changed" | one definition in `ApplicationService.revisions()` (profile hash + scoped answers revision + flywheel), used by MCP, UI and runner | `test_revisions_are_real_values_and_profile_changes_void_a_grant`, `test_a_new_scoped_answer_voids_a_pending_grant` |
+| 8 | M4 capabilities existed but were not reachable from the UI | `waiting_for_input` names the missing fields, answers can be given per application and prepare re-run; runner pause/resume/stop/policy/pass endpoints + UI; Jobs & Preferences sets titles/locations/include/exclude and previews why a posting is kept or filtered | `test_waiting_for_input_names_what_is_missing_and_can_be_resumed`, `test_runner_controls_and_policy_reach_the_real_runner`, `test_preferences_explain_why_a_posting_is_kept_or_filtered` |
+| 9 | Users had to `npm install && npm run build`; `stop` trusted a pid file on macOS; the local API had no session/origin protection | wheel ships `applyops/web` (verified in the built artifact); `stop` proves ownership by asking the recorded port to identify itself, and never signals a recycled pid; Host/Origin/session-token middleware, token injected into the served page | `test_frontend_build_resolution_prefers_a_packaged_console`, `test_stop_does_not_signal_a_pid_that_is_not_our_console`, `test_stop_signals_a_console_that_identifies_itself`, `test_local_api_requires_the_session_token_for_state_changes`, `test_local_api_refuses_a_foreign_host_or_origin` |
+
+### Bugs found *while* fixing the reported ones (not in the list)
+
+1. **`label=No` resolved to the "Notice period" field.** `resolve_ref` used
+   substring label matching, so the sponsorship radio and the notice select
+   collided. Now exact-first, substring as fallback.
+2. **The sponsorship radio was silently unselected.** The filler passed the
+   option's *text* ("No") where a boolean was expected, and falsy meant
+   "uncheck" -- so the form shipped with its most consequential question blank.
+3. **The page token was unreadable.** The server replaced `__APPLYOPS_TOKEN__`
+   including the property *name*, so `window.__APPLYOPS_TOKEN__` was `None` and
+   every state change from the UI was refused (403).
+4. **`demo_ats.py` used `json` without importing it** (the `/-/last-submission`
+   endpoint would have crashed on first use).
+5. **Repeated demo clicks deduped into one application** (same job id), so a
+   three-application test could not exist.
+6. **The runner submitted from whichever page the previous iteration left
+   loaded** -- now it returns to each application's own page and restores the
+   form, which is what its grant is bound to.
+
+### Test results (each run separately; see the note about sandbox memory)
+
+| suite | result |
+|---|---|
+| `tests/test_core.py` | 10 passed |
+| `tests/test_concurrency.py` | 12 passed |
+| `tests/test_m1_trusted_execution.py` | 40 passed |
+| `tests/test_m2_unified_core.py` | 23 passed |
+| `tests/test_m3_local_ui.py` | 9 passed (incl. the fill -> answer -> approve -> submit browser walk) |
+| `tests/test_m4_supervised_automation.py` | 13 passed |
+| `tests/test_m5_productization.py` | 9 passed |
+| `tests/test_acceptance_fixes.py` | 25 passed |
+| **total** | **141 passed, 0 failed** |
+| frontend `npx vitest run` | 7 passed |
+| frontend `npm run build` / `tsc --noEmit` | clean |
+| `uv build --wheel` | console shipped at `applyops/web` |
+| `ruff check src tools tests` | 138 findings, all pre-existing debt (pre-review baseline 143) |
+
+Three behaviours the earlier milestones *asserted* had to change with the
+product, and the tests were updated to assert the new truth rather than
+weakened: the demo ATS now rejects incomplete applications (M1/M2/M4 tests
+submit complete forms), submitting requires being on the approved page (the
+three-application test interleaves prepare/approve/submit), and `stop` cleans up
+stale pid files instead of assuming ownership.

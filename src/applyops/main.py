@@ -151,15 +151,32 @@ def _check_profile(memory) -> list[Check]:
     return checks
 
 
+def frontend_dist() -> Path | None:
+    """Where the built console lives, if it is available anywhere.
+
+    Packaged installs ship the build inside the wheel (`applyops/web`), so a
+    user who installed ApplyOps never runs npm. A checkout keeps using
+    `frontend/dist`. Only if neither exists does anything ask the user to build
+    -- and then with the one command that fixes it.
+    """
+    packaged = Path(__file__).parent / "web"
+    if (packaged / "index.html").exists():
+        return packaged
+    repo = Path(__file__).parent.parent.parent / "frontend" / "dist"
+    if (repo / "index.html").exists():
+        return repo
+    return None
+
+
 def _check_frontend() -> Check:
-    dist = Path(__file__).parent.parent.parent / "frontend" / "dist" / "index.html"
-    if dist.exists():
-        return Check("console frontend", True, str(dist.parent))
+    dist = frontend_dist()
+    if dist is not None:
+        return Check("console frontend", True, str(dist))
     return Check(
         "console frontend",
         False,
-        "frontend/dist is missing",
-        "cd frontend && npm install && npm run build",
+        "no built console found (neither packaged nor frontend/dist)",
+        "reinstall ApplyOps, or from a checkout run: cd frontend && npm install && npm run build",
     )
 
 
@@ -195,37 +212,66 @@ def _pid_file(data_dir: Path) -> Path:
     return data_dir / "ui.pid"
 
 
-def _write_pid(data_dir: Path) -> None:
-    _pid_file(data_dir).write_text(str(os.getpid()), encoding="utf-8")
+def _write_run_file(data_dir: Path, port: int) -> None:
+    """Record pid + port. The token is not written here on purpose."""
+    _pid_file(data_dir).write_text(
+        json.dumps({"pid": os.getpid(), "port": port}), encoding="utf-8"
+    )
 
 
-def _read_pid(data_dir: Path) -> int | None:
+def _read_run_file(data_dir: Path) -> dict | None:
     try:
-        return int(_pid_file(data_dir).read_text(encoding="utf-8").strip())
+        payload = json.loads(_pid_file(data_dir).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    return payload if isinstance(payload, dict) and payload.get("pid") else None
 
 
-def _pid_is_ours(pid: int) -> bool:
+def _console_is_ours(port: int) -> bool:
+    """Ask the process on `port` to identify itself.
+
+    macOS has no `/proc`, so "the pid file says so" was the entire check -- and a
+    recycled pid would then have meant signalling an unrelated process. The
+    replacement does not care what the OS knows: it speaks to the port the
+    console recorded and requires an ApplyOps status response. A stranger
+    listening there answers with something else, or nothing.
+    """
+    import urllib.error
+    import urllib.request
+
     try:
-        cmdline = Path(f"/proc/{pid}/cmdline")
-        if cmdline.exists():  # Linux
-            return "applyops" in cmdline.read_bytes().decode("utf-8", "ignore")
-    except OSError:
-        pass
-    # macOS has no /proc; the pid file is ours by construction and recent.
-    return True
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/status", timeout=2.0
+        ) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+    return isinstance(body, dict) and "profile_ready" in body and "version" in body
 
 
 def stop(data_dir: Path | None = None) -> int:
     root = data_dir or default_data_dir()
-    pid = _read_pid(root)
-    if not pid or not _pid_is_ours(pid):
-        print("No running console found (or the pid file is stale).")
+    record = _read_run_file(root)
+    if not record:
+        # Unparseable or empty: nothing can be proven from it, and leaving it
+        # behind would make the next `stop` print the same thing forever.
+        _pid_file(root).unlink(missing_ok=True)
+        print("No running console found (or the pid file was stale; cleaned up).")
         return 0
+
+    port = int(record.get("port") or 0)
+    if not port or not _console_is_ours(port):
+        print(
+            "The recorded console does not answer on its port, so this will not "
+            "signal that pid -- it may have been recycled by another program."
+        )
+        _pid_file(root).unlink(missing_ok=True)
+        return 1
+
+    pid = int(record["pid"])
     try:
         os.kill(pid, signal.SIGTERM)
-        print(f"Stopped console (pid {pid}).")
+        print(f"Stopped console (pid {pid}, port {port}).")
     except ProcessLookupError:
         print("The recorded console is already gone; cleaning up the pid file.")
     finally:
@@ -237,11 +283,11 @@ def serve(data_dir: Path | None = None, port: int = 8620, *, demo: bool = False)
     from .api.app import create_app
 
     root = data_dir or default_data_dir()
-    dist = Path(__file__).parent.parent.parent / "frontend" / "dist"
-    if not (dist / "index.html").exists():
+    dist = frontend_dist()
+    if dist is None:
         print(
-            "The console frontend is not built yet.\n"
-            "  fix: cd frontend && npm install && npm run build",
+            "No built console found, and this copy of ApplyOps did not ship one.\n"
+            "  fix (from a checkout): cd frontend && npm install && npm run build",
             file=sys.stderr,
         )
         return 1
@@ -267,7 +313,7 @@ def serve(data_dir: Path | None = None, port: int = 8620, *, demo: bool = False)
 
     import uvicorn
 
-    _write_pid(root)
+    _write_run_file(root, port)
     try:
         print(f"ApplyOps console: http://127.0.0.1:{port}  (loopback only)")
         uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
@@ -295,6 +341,12 @@ def main(argv: list[str] | None = None) -> int:
     demo_parser = sub.add_parser("demo", help="run the console with a demo job queued")
     demo_parser.add_argument("--port", type=int, default=8620)
     sub.add_parser("stop", help="stop a running console")
+    approve_parser = sub.add_parser(
+        "approve", help="review and decide a pending submission request"
+    )
+    approve_parser.add_argument(
+        "request_id", nargs="?", help="the request to decide; omit to list pending"
+    )
     sub.add_parser("version", help="print the version")
 
     args = parser.parse_args(argv)
@@ -308,6 +360,15 @@ def main(argv: list[str] | None = None) -> int:
         return serve(root, port=args.port, demo=True)
     if args.command == "stop":
         return stop(root)
+    if args.command == "approve":
+        # The human channel, reachable from the one command a user knows.
+        from .approve import decide, list_requests
+        from .authorization import SubmissionAuthorizer
+
+        authorizer = SubmissionAuthorizer(root or default_data_dir())
+        if args.request_id:
+            return decide(authorizer, args.request_id)
+        return list_requests(authorizer)
     if args.command == "version":
         print(json.dumps({"version": APP_VERSION}))
         return 0

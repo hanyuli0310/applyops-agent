@@ -31,6 +31,7 @@ from applyops.authorization import (
 )
 from applyops.browser import BrowserController
 from applyops.demo_ats import DemoATS, write_sample_resume
+from applyops.filling import fill_application_form
 from applyops.memory import MemoryStore
 from applyops.resume import (
     ResumeNotConfigured,
@@ -59,6 +60,27 @@ from applyops.verification import (
 
 def _tmp() -> Path:
     return Path(tempfile.mkdtemp(prefix="applyops-m1-"))
+
+
+def _seeded_memory_and_answers(root: Path):
+    """A profile plus the one answer the demo form wants beyond it."""
+    from applyops.answers import AnswerStore
+    from applyops.memory import MemoryStore
+
+    memory = MemoryStore(root / "memory.json")
+    memory.update_profile(
+        {
+            "name": "Jane Doe",
+            "email": "jane@example.com",
+            "phone": "+1 555 010 4477",
+            "years_experience": "4",
+            "requires_sponsorship": "no",
+            "resume_path": str(root / "resume.pdf"),
+        }
+    )
+    answers = AnswerStore(root)
+    answers.set_answer("Notice period", "Two weeks")
+    return memory, answers
 
 
 async def _browser(root: Path) -> BrowserController:
@@ -597,6 +619,7 @@ async def test_form_changed_after_approval_sends_nothing():
                 fields=snapshot,
                 resume_filename=resume.name,
                 resume_sha256=resolve_resume(str(resume)).sha256,
+                page_url=browser.page.url,
                 requested_by="mcp",
             )
             grant = auth.approve_request(request.request_id, source="cli_human")
@@ -625,11 +648,16 @@ async def test_form_changed_after_approval_sends_nothing():
 async def test_authorized_submission_is_verified_and_spent_once():
     with DemoATS() as ats:
         browser = await _new_browser_and_form(ats.url)
-        auth = SubmissionAuthorizer(_tmp())
-        resume = write_sample_resume(_tmp() / "resume.pdf")
+        root = _tmp()
+        auth = SubmissionAuthorizer(root)
+        resume = write_sample_resume(root / "resume.pdf")
+        memory, answers = _seeded_memory_and_answers(root)
         try:
-            await browser.fill_field(await _ref_for(browser, "Full name"), "Jane Doe")
-            await browser.select_option(await _ref_for(browser, "Notice period"), "Two weeks")
+            report = await fill_application_form(
+                browser, memory=memory, answers=answers,
+                resume=resolve_resume(str(resume)), application_id="app-1",
+            )
+            assert report.ready, report.to_dict()
             snapshot = await browser.field_snapshot()
             request = auth.create_request(
                 job_key="job-1",
@@ -639,6 +667,7 @@ async def test_authorized_submission_is_verified_and_spent_once():
                 fields=snapshot,
                 resume_filename=resume.name,
                 resume_sha256=resolve_resume(str(resume)).sha256,
+                page_url=browser.page.url,
                 requested_by="mcp",
             )
             grant = auth.approve_request(request.request_id, source="cli_human")
@@ -688,6 +717,7 @@ async def test_unconfirmed_submission_is_never_retried_and_never_confirmed():
                 fields=snapshot,
                 resume_filename=resume.name,
                 resume_sha256=resolve_resume(str(resume)).sha256,
+                page_url=browser.page.url,
                 requested_by="mcp",
             )
             grant = auth.approve_request(request.request_id, source="cli_human")

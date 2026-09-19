@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, Application, STATE_LABELS } from "../api";
+import { api, Application, Preferences, STATE_LABELS } from "../api";
 
 export function JobsPage({ onChanged }: { onChanged: () => void }) {
   const [jobs, setJobs] = useState<Application[]>([]);
@@ -8,12 +8,23 @@ export function JobsPage({ onChanged }: { onChanged: () => void }) {
   const [company, setCompany] = useState("");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const [prefs, setPrefs] = useState<Preferences>({
+    target_titles: [],
+    locations: [],
+    include_keywords: [],
+    exclude_keywords: [],
+    exclude_companies: [],
+  });
+  const [preview, setPreview] = useState<{ keep: boolean; reasons: string[] } | null>(null);
 
   const reload = useCallback(() => {
     api.applications().then((r) => setJobs(r.applications));
   }, []);
 
   useEffect(reload, [reload]);
+  useEffect(() => {
+    api.preferences().then(setPrefs);
+  }, []);
 
   const add = async (body: { job_url: string; title?: string; company?: string }) => {
     setError("");
@@ -30,6 +41,29 @@ export function JobsPage({ onChanged }: { onChanged: () => void }) {
       setError(String((err as Error).message ?? err));
     }
   };
+
+  const savePrefs = async () => {
+    setError("");
+    try {
+      const saved = await api.savePreferences(prefs);
+      setPrefs(saved);
+      setMessage("偏好已保存。新入队的岗位会按这些规则判断，并给出理由。");
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+    }
+  };
+
+  const runPreview = async () => {
+    setError("");
+    try {
+      const decision = await api.previewPreference({ title, company, location: url });
+      setPreview(decision);
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+    }
+  };
+
+  const csv = (values: string[]) => values.join(", ");
 
   const startDemo = async () => {
     setError("");
@@ -76,6 +110,76 @@ export function JobsPage({ onChanged }: { onChanged: () => void }) {
           <button data-testid="demo-start" onClick={startDemo}>
             一键添加演示岗位（本地）
           </button>
+          <button
+            data-testid="preview-rule"
+            onClick={runPreview}
+            disabled={!title.trim()}
+          >
+            为什么保留/过滤？（预览）
+          </button>
+        </div>
+        {preview && (
+          <div className={preview.keep ? "banner ok" : "banner error"} data-testid="preview-result">
+            <strong>{preview.keep ? "会被保留" : "会被过滤"}</strong>
+            <ul>
+              {preview.reasons.map((r) => (
+                <li key={r}>{r}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+
+      <div className="card">
+        <h3>筛选偏好（决定什么岗位会被留下，以及为什么）</h3>
+        <p className="hint">
+          标题按「整词」匹配：填 <code>backend engineer</code> 会匹配 “Senior Backend Engineer”，
+          但不会匹配 “Frontend Engineer”，也不会因为 <code>intern</code> 而误伤 “internal tools”。
+        </p>
+        <label>
+          目标职位（逗号分隔）
+          <input
+            data-testid="pref-titles"
+            value={csv(prefs.target_titles)}
+            onChange={(e) => setPrefs({ ...prefs, target_titles: splitCsv(e.target.value) })}
+          />
+        </label>
+        <label>
+          目标地点（逗号分隔）
+          <input
+            data-testid="pref-locations"
+            value={csv(prefs.locations)}
+            onChange={(e) => setPrefs({ ...prefs, locations: splitCsv(e.target.value) })}
+          />
+        </label>
+        <label>
+          必须包含关键词（逗号分隔）
+          <input
+            data-testid="pref-include"
+            value={csv(prefs.include_keywords)}
+            onChange={(e) => setPrefs({ ...prefs, include_keywords: splitCsv(e.target.value) })}
+          />
+        </label>
+        <label>
+          排除关键词（逗号分隔）
+          <input
+            data-testid="pref-exclude"
+            value={csv(prefs.exclude_keywords)}
+            onChange={(e) => setPrefs({ ...prefs, exclude_keywords: splitCsv(e.target.value) })}
+          />
+        </label>
+        <label>
+          排除公司（逗号分隔）
+          <input
+            data-testid="pref-companies"
+            value={csv(prefs.exclude_companies)}
+            onChange={(e) => setPrefs({ ...prefs, exclude_companies: splitCsv(e.target.value) })}
+          />
+        </label>
+        <div className="actions">
+          <button data-testid="pref-save" onClick={savePrefs}>
+            保存偏好
+          </button>
         </div>
       </div>
 
@@ -91,8 +195,15 @@ export function JobsPage({ onChanged }: { onChanged: () => void }) {
         ))}
       </div>
 
-      {message && <div className="banner ok">{message}</div>}
+      {message && <div className="banner ok" data-testid="jobs-message">{message}</div>}
       {error && <div className="banner error">{error}</div>}
     </section>
   );
+}
+
+function splitCsv(value: string): string[] {
+  return value
+    .split(",")
+    .map((v) => v.trim())
+    .filter((v) => v !== "");
 }

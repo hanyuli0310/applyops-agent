@@ -25,6 +25,8 @@ the safety tests exercise.
 from __future__ import annotations
 
 import html
+import json
+import re
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +35,58 @@ from typing import Self
 from urllib.parse import parse_qs, urlparse
 
 CONFIRMED_TEXT = "Application received"
+FAILED_TEXT = "There was a problem with your submission"
+
+#: What a real ATS refuses to accept an application without. The demo validates
+#: these for the same reason: an empty form that "succeeds" would let a broken
+#: filler look green, which is exactly the bug this server has to be able to
+#: catch.
+REQUIRED_FIELDS = ("name", "email", "phone", "years", "notice_period", "needs_sponsorship")
+REQUIRED_FILE_FIELD = "resume"
+
+
+def parse_multipart(body: bytes, content_type: str) -> tuple[dict[str, str], dict[str, str]]:
+    """Pull fields and filenames out of a multipart/form-data body.
+
+    Minimal on purpose -- enough to prove what actually arrived, and nothing
+    more. A parser that was clever about encodings would be a place for the
+    verification to hide a mistake.
+    """
+    fields: dict[str, str] = {}
+    files: dict[str, str] = {}
+    if "boundary=" not in (content_type or ""):
+        return fields, files
+    boundary = content_type.split("boundary=", 1)[1].strip().strip('"')
+    delimiter = b"--" + boundary.encode()
+    for part in body.split(delimiter):
+        if not part.strip() or part.strip() == b"--":
+            continue
+        head, _, payload = part.partition(b"\r\n\r\n")
+        headers = head.decode("utf-8", "ignore")
+        payload = payload.rstrip(b"\r\n-")
+        name_match = re.search(r'name="([^"]*)"', headers)
+        name = name_match.group(1) if name_match else ""
+        if not name:
+            continue
+        filename_match = re.search(r'filename="([^"]*)"', headers)
+        if filename_match:
+            if filename_match.group(1):
+                files[name] = filename_match.group(1)
+        else:
+            fields[name] = payload.decode("utf-8", "ignore").strip()
+    return fields, files
+
+
+def validate_submission(fields: dict[str, str], files: dict[str, str]) -> list[str]:
+    """What is wrong with this application, as a list a human can read."""
+    problems = [
+        f"missing or empty field: {name}"
+        for name in REQUIRED_FIELDS
+        if not fields.get(name)
+    ]
+    if not files.get(REQUIRED_FILE_FIELD):
+        problems.append("no resume file attached")
+    return problems
 
 #: What the demo says when the same file has been attached before.
 STALE_RESUME_NAME = "resume-v1-old.pdf"
@@ -107,12 +161,16 @@ def _form(scenario: str) -> str:
         "<form method='post' "
         f"action='/submit?scenario={html.escape(scenario)}' "
         "enctype='multipart/form-data'>"
-        "<label for='name'>Full name</label><input id='name' name='name' type='text'>"
-        "<label for='email'>Email</label><input id='email' name='email' type='email'>"
-        "<label for='phone'>Phone</label><input id='phone' name='phone' type='text'>"
-        "<label for='years'>Years of experience</label><input id='years' name='years' type='number'>"
+        "<label for='name'>Full name</label>"
+        "<input id='name' name='name' type='text' required>"
+        "<label for='email'>Email</label>"
+        "<input id='email' name='email' type='email' required>"
+        "<label for='phone'>Phone</label>"
+        "<input id='phone' name='phone' type='text' required>"
+        "<label for='years'>Years of experience</label>"
+        "<input id='years' name='years' type='number' required>"
         "<label for='notice'>Notice period</label>"
-        "<select id='notice' name='notice_period'>"
+        "<select id='notice' name='notice_period' required>"
         "<option value=''>Select…</option>"
         "<option value='immediately'>Immediately</option>"
         "<option value='two_weeks'>Two weeks</option>"
@@ -120,10 +178,11 @@ def _form(scenario: str) -> str:
         "</select>"
         "<label>Do you now, or will you in the future, require visa sponsorship?"
         "</label>"
-        "<label><input type='radio' name='needs_sponsorship' value='yes'> Yes</label>"
-        "<label><input type='radio' name='needs_sponsorship' value='no'> No</label>"
+        "<label><input type='radio' name='needs_sponsorship' value='yes' required> Yes</label>"
+        "<label><input type='radio' name='needs_sponsorship' value='no' required> No</label>"
         f"{stale_block}"
-        "<label for='resume'>Resume</label><input id='resume' name='resume' type='file'>"
+        "<label for='resume'>Resume</label>"
+        "<input id='resume' name='resume' type='file' required>"
         "<p><button type='submit'>Submit application</button></p>"
         "</form>",
     )
@@ -137,6 +196,10 @@ class DemoATS:
         self.port = port
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        #: Exactly what the last POST carried: the fields, the filenames and
+        #: any validation problems. Tests assert against this rather than against
+        #: the word "received", because the interesting question is *what* arrived.
+        self.last_submission: dict = {}
 
     @property
     def url(self) -> str:
@@ -177,54 +240,96 @@ class DemoATS:
                 if parsed.path == "/form":
                     self._write(200, _form(scenario))
                     return
+                if parsed.path == "/-/last-submission":
+                    payload = json.dumps(outer.last_submission, ensure_ascii=False).encode(
+                        "utf-8"
+                    )
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 self._write(200, _index(outer.url))
 
             def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length") or 0)
-                if length:
-                    # Consume the multipart body so the socket closes cleanly.
-                    # Its content is irrelevant to what is being tested here.
-                    self.rfile.read(length)
+                body = self.rfile.read(length) if length else b""
                 parsed = urlparse(self.path)
                 scenario = parse_qs(parsed.query).get("scenario", ["standard"])[0]
+
+                if scenario == "slow":
+                    # Never answer within a test's lifetime: the SubMITTED_UNVERIFIED
+                    # shape. Nothing is validated because nothing comes back.
+                    import time
+
+                    time.sleep(SLOW_DELAY_SECONDS)
+                    try:
+                        self._write(
+                            200, _page("Late — Demo ATS", f"<p>{CONFIRMED_TEXT}</p>")
+                        )
+                    except Exception:  # noqa: BLE001 - socket died while we slept
+                        return
+                    return
+
+                fields, files = parse_multipart(body, self.headers.get("Content-Type", ""))
+                outer.last_submission = {
+                    "scenario": scenario,
+                    "fields": fields,
+                    "files": files,
+                    "path": self.path,
+                }
+
                 if scenario == "error":
                     self._write(
                         200,
                         _page(
                             "Submission failed — Demo ATS",
-                            "<div class='banner error'>There was a problem with your "
-                            "submission. Please review the highlighted fields.</div>"
+                            f"<div class='banner error'>{FAILED_TEXT}. Please review the "
+                            "highlighted fields.</div>"
                             "<p><a href='/form'>Back to the form</a></p>",
                         ),
                     )
                     return
-                if scenario == "slow":
-                    # Never answer: the request stays open until the socket dies.
-                    import time
 
-                    # Never answer within the lifetime of a test: the request
-                    # stays open, which is the SubMITTED_UNVERIFIED shape. The
-                    # delay must outlast the whole reconcile window, otherwise
-                    # "still unknown" and "eventually known" race each other.
-                    time.sleep(SLOW_DELAY_SECONDS)
-                    try:
-                        self._write(
-                            200,
-                            _page("Late — Demo ATS", f"<p>{CONFIRMED_TEXT}</p>"),
-                        )
-                    except Exception:  # noqa: BLE001 - socket died while we slept
-                        return
+                # Real validation, because a demo that accepts anything cannot
+                # tell a working filler from a broken one.
+                problems = validate_submission(fields, files)
+                if problems:
+                    outer.last_submission["problems"] = problems
+                    self._write(
+                        200,
+                        _page(
+                            "Submission failed — Demo ATS",
+                            f"<div class='banner error'>{FAILED_TEXT}.</div><ul>"
+                            + "".join(f"<li>{html.escape(p)}</li>" for p in problems)
+                            + "</ul><p><a href='/form'>Back to the form</a></p>",
+                        ),
+                    )
                     return
+
                 confirmation = str(uuid.uuid4())[:8].upper()
+                outer.last_submission["confirmation"] = confirmation
+                # Echo what we actually received. A page that only says
+                # "received" cannot be used to prove the *contents* arrived.
+                received = "".join(
+                    f"<li>{html.escape(k)}: {html.escape(v)}</li>" for k, v in sorted(fields.items())
+                )
+                attachments = "".join(
+                    f"<li>{html.escape(k)}: {html.escape(v)}</li>" for k, v in sorted(files.items())
+                )
                 self._write(
                     200,
                     _page(
                         "Received — Demo ATS",
                         f"<div class='banner'>{CONFIRMED_TEXT}</div>"
                         f"<p>Your confirmation id is <strong>{confirmation}</strong>.</p>"
+                        f"<h2>What we received</h2><ul>{received}</ul>"
+                        f"<h2>Attachments</h2><ul>{attachments}</ul>"
                         "<p><a href='/form'>Apply again</a></p>",
                     ),
                 )
+
 
         self._server = ThreadingHTTPServer((self.host, self.port), Handler)
         self._server.daemon_threads = True

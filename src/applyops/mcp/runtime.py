@@ -145,6 +145,7 @@ class Runtime:
                 memory=self.memory,
                 authorizer=self.authorizer,
                 ledger=Ledger(self.data_dir / "app.sqlite"),
+                guardrails=self.guardrails,
             )
         return self._service
 

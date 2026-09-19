@@ -48,10 +48,10 @@ from ..resume import (
     ResumeRef,
     resolve_resume,
 )
+from ..state_machine import InvalidTransition
 from ..submission import (
     FinalAction,
     SubmissionRefused,
-    execute_authorized_submission,
 )
 from ..submission import (
     reconcile_submission as reconcile_submission_impl,
@@ -762,56 +762,20 @@ def register(server: MCPServer, runtime: Runtime) -> None:
         )
 
     @server.tool()
-    async def submit_application(
-        grant_id: str,
-        job_url: str,
-        job_id: str = "",
-        job_title: str = "",
-        company: str = "",
-        platform: str = "",
-        ats: str = "",
-        apply_route: str = "easy_apply",
-        answers_used: list[str] | None = None,
-        steps: int = 0,
-        vision_fallbacks: int = 0,
-        outcome: str = "unverified",
-    ) -> str:
-        """Record that a submission was made. It does not perform one, and it
-        does not decide whether the submission succeeded.
+    async def submit_application(grant_id: str, job_url: str, job_id: str = "") -> str:
+        """Read back what the ledger recorded for an approved submission.
 
-        This is bookkeeping for submissions driven outside this server (the mouse
-        was clicked by a person, or by an older runner). What it promises about
-        the outcome comes entirely from `outcome`, which defaults to `unverified`:
+        This tool used to *accept* `outcome="verified"` from its caller, which
+        meant a model could type the word "verified" and have a success written
+        into history. A verdict has to come from evidence, so this is now a
+        read-only view of the attempt row that `submit_final` produced: the
+        outcome, the grant, the matched confirmation text and the page it was
+        seen on.
 
-        - `verified`   -- the page confirmed it;
-        - `unverified` -- sent, possibly received, never confirmed (**default**);
-        - `failed`     -- never sent, or rejected.
-
-        The previous version accepted `acknowledged=True` and wrote a success.
-        That flag was supplied by whoever called the tool, so "the user approved"
-        and "the caller claims the user approved" were the same input -- and the
-        only real gate, a summary shown to nobody in particular, was downstream
-        of the click anyway. `submit_final` replaces that: it *is* the final
-        action, and it only runs with a grant a human minted separately.
+        It performs no submission and records nothing. If nothing was submitted
+        under that grant, it says so -- "approved but never sent" is a real state
+        and not a success.
         """
-        if not grant_id:
-            return _json(
-                {
-                    "recorded": False,
-                    "error": (
-                        "grant_id is required. To record something you did outside "
-                        "this server, first create a request with "
-                        "request_submission_grant and have a human approve it. "
-                        "Rails (daily cap, dedupe, pacing) are enforced by "
-                        "preflight regardless."
-                    ),
-                    "hint": (
-                        "A grant id proves a person authorized an exact snapshot of "
-                        "this application; a boolean does not."
-                    ),
-                }
-            )
-
         grant = runtime.authorizer.peek(grant_id)
         if grant is None:
             return _json({"recorded": False, "error": "unknown grant id"})
@@ -820,50 +784,50 @@ def register(server: MCPServer, runtime: Runtime) -> None:
                 {
                     "recorded": False,
                     "error": (
-                        "that grant has not been spent by submit_final, so there is "
-                        "nothing corresponding to it to record."
+                        "that grant was never spent, so there is no submission to "
+                        "report. Ask for the outcome from submit_final instead."
                     ),
                 }
             )
-        if grant.job_key not in {job_id, extract_job_id(job_url), job_url}:
+
+        row = (
+            runtime.service.get(grant.application_id)
+            if grant.application_id
+            else runtime.service.ledger.find_by_job_key(grant.job_key)
+        )
+        if row is None:
+            return _json(
+                {"recorded": False, "error": "no application on record for this grant"}
+            )
+
+        attempt = next(
+            (a for a in runtime.service.ledger.attempts(row.id) if a.grant_id == grant_id),
+            None,
+        )
+        if attempt is None:
             return _json(
                 {
                     "recorded": False,
-                    "error": f"grant {grant_id[:8]}… was issued for a different job",
+                    "error": "the ledger holds no attempt for this grant; nothing to report",
                 }
             )
 
-        record = runtime.memory.add_application(
-            job_url=job_url,
-            job_id=job_id,
-            job_title=job_title,
-            company=company,
-            platform=platform or platform_for_url(job_url),
-            ats=ats,
-            apply_route=apply_route,
-            answers_used=answers_used or [],
-            steps=steps,
-            vision_fallbacks=vision_fallbacks,
-            status="applied",
-            outcome=outcome,
-            grant_id=grant_id,
-            resume_sha256=grant.resume_sha256,
-        )
-        # The rails are only advanced by outcomes we can defend: an unverified
-        # result must not be counted as a working submission.
-        if outcome == "verified":
-            runtime.guardrails.record_outcome(success=True)
-        elif outcome == "unverified":
-            runtime.guardrails.record_unverified(note="recorded externally, unconfirmed")
-        else:
-            runtime.guardrails.record_outcome(success=False, note="recorded as failed")
         return _json(
             {
                 "recorded": True,
-                "application": record.model_dump(),
-                "guard": runtime.guardrails.stats(),
+                "application_id": row.id,
+                "application_state": row.state,
+                "outcome": attempt.outcome,
+                "detail": attempt.detail,
+                "evidence": attempt.to_dict().get("evidence", {}),
+                "grant_id": grant_id,
+                "hint": (
+                    "the outcome above is what the page said at submit time; no "
+                    "caller chose it."
+                ),
             }
         )
+
 
     @server.tool()
     async def report_failure(
@@ -920,7 +884,10 @@ def register(server: MCPServer, runtime: Runtime) -> None:
 
     @server.tool()
     async def request_submission_grant(
-        job_url: str, job_id: str = "", route: str = "easy_apply"
+        job_url: str,
+        job_id: str = "",
+        route: str = "easy_apply",
+        application_id: str = "",
     ) -> str:
         """Ask a human to authorize one specific submission. Authorizes nothing itself.
 
@@ -947,6 +914,7 @@ def register(server: MCPServer, runtime: Runtime) -> None:
 
             snapshot = await browser.field_snapshot()
             platform = evidence_platform(browser.page.url)
+            profile_revision, answers_revision = runtime.service.revisions()
             request = runtime.authorizer.create_request(
                 job_key=job_id or extract_job_id(job_url) or job_url,
                 job_url=job_url,
@@ -955,9 +923,11 @@ def register(server: MCPServer, runtime: Runtime) -> None:
                 fields=snapshot,
                 resume_filename=resume.filename,
                 resume_sha256=resume.sha256,
-                answers_revision=_answers_revision(runtime),
-                profile_revision=_profile_revision(runtime),
-                source="mcp_relayed_to_human",
+                answers_revision=answers_revision,
+                profile_revision=profile_revision,
+                application_id=application_id,
+                page_url=browser.page.url,
+                requested_by="mcp_relayed_to_human",
             )
             return _json(
                 {
@@ -1000,6 +970,7 @@ def register(server: MCPServer, runtime: Runtime) -> None:
         job_url: str,
         job_id: str = "",
         route: str = "easy_apply",
+        application_id: str = "",
         final_ref: str = "",
         final_name: str = "",
         evidence_text: str = "",
@@ -1037,25 +1008,37 @@ def register(server: MCPServer, runtime: Runtime) -> None:
             if action is None:
                 return _json({"submitted": False, "error": detect_detail})
 
-            patterns: tuple[str, ...]
-            if evidence_text:
-                patterns = (evidence_text,)
-            else:
-                patterns = success_patterns_for(browser.page.url)
+            # The ledger row *is* the application. Without it there is nothing to
+            # claim, nothing to attach the outcome to, and no way to apply the
+            # same rails the UI and the runner use.
+            row = (
+                runtime.service.get(application_id)
+                if application_id
+                else runtime.service.ledger.find_by_job_key(
+                    job_id or extract_job_id(job_url) or job_url
+                )
+            )
+            if row is None:
+                return _json(
+                    {
+                        "submitted": False,
+                        "error": (
+                            "no application on record for this job. Call "
+                            "enqueue_application first: submissions run through the "
+                            "ledger so quota, dedupe and outcomes stay consistent "
+                            "across every driver."
+                        ),
+                    }
+                )
 
             try:
-                outcome = await execute_authorized_submission(
-                    controller=browser,
-                    authorizer=runtime.authorizer,
+                outcome = await runtime.service.submit(
+                    row.id,
                     grant_id=grant_id,
-                    job_key=job_id or extract_job_id(job_url) or job_url,
+                    controller=browser,
                     resume=resume,
-                    route=route,
                     action=action,
-                    answers_revision=_answers_revision(runtime),
-                    profile_revision=_profile_revision(runtime),
-                    route_supported=bool(patterns),
-                    evidence_timeout=12.0,
+                    route=route,
                 )
             except SubmissionRefused as exc:
                 return _json(
@@ -1066,22 +1049,19 @@ def register(server: MCPServer, runtime: Runtime) -> None:
                         "manual_required": exc.manual_required,
                     }
                 )
-
-            if outcome.failed:
-                runtime.guardrails.record_outcome(success=False, note=outcome.detail)
-                _record_application(runtime, job_url, job_id, resume, outcome, "failed")
-            elif outcome.verified:
-                runtime.guardrails.record_outcome(success=True)
-                _record_application(runtime, job_url, job_id, resume, outcome, "applied")
-            else:
-                # SENT BUT UNCONFIRMED: the slot is spent, because the employer
-                # may well have received it, and retrying is forbidden.
-                runtime.guardrails.record_unverified()
-                _record_application(runtime, job_url, job_id, resume, outcome, "applied")
+            except InvalidTransition as exc:
+                return _json(
+                    {
+                        "submitted": False,
+                        "refused": True,
+                        "reason": f"application {row.id} is not submittable: {exc}",
+                    }
+                )
 
             return _json(
                 {
                     "submitted": True,
+                    "application_id": row.id,
                     **outcome.to_dict(),
                     "guard": runtime.guardrails.stats(),
                     "hint": (

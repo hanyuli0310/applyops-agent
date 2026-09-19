@@ -31,6 +31,7 @@ from .answers import AnswerStore
 from .browser import BrowserController
 from .concurrency import atomic_write_json, data_lock_path, read_json
 from .evidence import detect_final_action
+from .filling import fill_application_form, resume_for_fill
 from .memory import MemoryStore
 from .resume import ResumeError, ResumeRef, resolve_resume
 from .service import ApplicationService
@@ -258,27 +259,49 @@ class QueueRunner:
         return resolve_resume(configured)
 
     async def _prepare_one(self, application_id: str, controller: BrowserController) -> dict:
-        """Open the posting, read the form, file the approval request.
+        """Open the posting, **fill it**, then file the approval request.
 
-        Raises `ResumeError` when no resume is configured -- the caller parks
-        the application, because attaching nothing is not a decision this code
-        may make.
+        The filling step is not optional. A runner that only reads the form asks
+        a human to approve an empty application, which is worse than asking for
+        nothing: the approval is real and the submission it authorizes is not.
+
+        Raises `ResumeError` when no resume is configured -- the caller parks the
+        application, because attaching nothing is not a decision this code may
+        make.
         """
         resume = self._resume()  # raises ResumeError -> parked by the caller
         row = self.service.get(application_id)
         assert row is not None
 
         await controller.goto(row.job_url, settle=1.0)
-        snapshot = await controller.field_snapshot()
-        unreadable = [k for k, v in snapshot.items() if v in {"<unreadable>", "<unresolvable>"}]
-        if unreadable:
+        report = await fill_application_form(
+            controller,
+            memory=self.memory,
+            answers=self.answers,
+            resume=resume_for_fill(self.memory) or resume,
+            application_id=application_id,
+            company=row.company,
+        )
+        if not report.ready:
+            missing = (
+                report.unfilled_required
+                or report.unreadable
+                or [m.label for m in report.mismatched]
+                or report.problems
+            )
             self.service.prepare(
                 application_id,
                 ready=False,
-                detail=f"could not read fields: {', '.join(unreadable)}",
+                detail=f"needs input before it can be submitted: {', '.join(missing)}",
+                payload={"fill_report": report.to_dict()},
             )
-            return {"state": ApplicationState.WAITING_FOR_INPUT.value, "detail": "unreadable fields"}
+            return {
+                "state": ApplicationState.WAITING_FOR_INPUT.value,
+                "detail": f"missing: {', '.join(missing)}",
+            }
 
+        snapshot = await controller.field_snapshot()
+        profile_revision, answers_revision = self.service.revisions()
         request = self.service.authorizer.create_request(
             job_key=row.job_key,
             job_url=row.job_url,
@@ -287,6 +310,10 @@ class QueueRunner:
             fields=snapshot,
             resume_filename=resume.filename,
             resume_sha256=resume.sha256,
+            answers_revision=answers_revision,
+            profile_revision=profile_revision,
+            application_id=application_id,
+            page_url=controller.page.url,
             requested_by="queue_runner",
         )
         self.service.prepare(application_id, ready=True, detail=f"request {request.request_id}")
@@ -314,6 +341,32 @@ class QueueRunner:
     ) -> SubmitOutcome:
         row = self.service.get(application_id)
         assert row is not None
+
+        # Go back to *this* application's page and restore the form before
+        # submitting. Two reasons, both about the same honesty:
+        #
+        # - the grant is bound to that page, so submitting from whatever page
+        #   the previous iteration left loaded would be refused (correctly) and
+        #   the pass would look broken;
+        # - the approval covers the values that were on the form, so the form has
+        #   to be put back into that state from the same sources. If it cannot be
+        #   reproduced, the digest will not match and the grant refuses rather
+        #   than sending something nobody saw.
+        await controller.goto(row.job_url, settle=1.0)
+        report = await fill_application_form(
+            controller,
+            memory=self.memory,
+            answers=self.answers,
+            resume=self._resume(),
+            application_id=application_id,
+            company=row.company,
+        )
+        if not report.ready:
+            raise SubmissionRefused(
+                "the form could not be restored to its approved state: "
+                + ", ".join(report.unfilled_required or report.unreadable or ["unknown"])
+            )
+
         action, detail = await detect_final_action(controller)
         if action is None:
             raise SubmissionRefused(detail)

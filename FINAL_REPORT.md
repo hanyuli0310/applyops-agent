@@ -144,3 +144,110 @@ uv sync --extra dev                     # pick up the console script
 5. Sharded CI (unit / concurrency / browser) with the frontend build cached.
 6. 3–5 external testers on the demo flow; measure time-to-first-approval and
    interruptions per application (`PLAN.md` §7 M5 acceptance metrics).
+
+---
+
+# Addendum — acceptance review fixes
+
+After the v0.2 review, a follow-up pass fixed nine acceptance problems plus six
+defects found while fixing them. Everything below is implemented, tested and
+**left uncommitted in the working tree for review**.
+
+## What changed, in one paragraph per problem
+
+1. **MCP authorization actually runs.** `request_submission_grant` was calling
+   `create_request(source=...)`; the parameter is `requested_by`, so the whole
+   MCP request flow raised `TypeError`. Fixed, and `applyops approve <request_id>`
+   is now a real subcommand of the installed console script (previously the
+   documented command did not exist). Approval still refuses to decide
+   non-interactively.
+
+2. **`prepare` prepares.** It used to read an empty form and ask a human to
+   approve it. New `src/applyops/filling.py` fills from the profile and scoped
+   answers, verifies every read-back, uploads the configured resume and verifies
+   the attachment; anything unresolved, unreadable or mismatched parks the
+   application in `waiting_for_input` with the field names. The demo ATS now
+   parses the submitted multipart body, validates required fields and the
+   resume, and echoes what it received -- so the E2E asserts `Jane Doe`,
+   `jane@example.com`, `two_weeks`, `no` (sponsorship) and `resume.pdf` arrived,
+   not merely that a page said "received".
+
+3. **Grants are bound to one application.** The UI used to spend "the first
+   grant in localStorage". Grants are now stored per application id, the API
+   returns the application with the approval, and three consecutive
+   applications each submit with their own grant (replays, expiry and
+   cross-application use are all covered).
+
+4. **The browser must be on the approved page.** Identity is host + path +
+   non-tracking query, recorded when the request is filed and re-checked at
+   submit; `application_id` is non-transferable. Preparing A, preparing B and
+   then submitting A from B's page is refused *before* anything is sent, and the
+   approval is not burned.
+
+5. **One execution core.** MCP `submit_final` now goes through
+   `ApplicationService`, which applies preflight (quota, spacing, breaker,
+   dedupe) and records rails and history. `submit_application` no longer accepts
+   an `outcome`; it reads back the ledger attempt, so a verdict can only come
+   from evidence.
+
+6. **Browser concurrency.** The console takes the same cross-process profile
+   lock as every other driver, refuses with the holder's name, and releases it
+   on close. Verified from a child process.
+
+7. **Revisions are real.** `ApplicationService.revisions()` is the single
+   definition (profile hash + scoped-answer revision + flywheel), used by MCP,
+   the UI and the runner; a profile edit or a new scoped answer voids pending
+   grants.
+
+8. **M4 is reachable from the UI.** `waiting_for_input` lists what is missing,
+   accepts an answer for that application and re-prepares; pause/resume/stop and
+   the bounded auto-mode policy are wired to the real runner; Jobs & Preferences
+   stores titles/locations/include/exclude rules and previews, in words, why a
+   posting is kept or filtered.
+
+9. **Productisation finished.** The wheel ships the built console at
+   `applyops/web` (verified in the artifact), so an installed ApplyOps never
+   asks the user for npm. `applyops stop` proves ownership by asking the
+   recorded port to identify itself instead of trusting a pid file (macOS has no
+   `/proc`). The local API rejects foreign hosts and origins and requires a
+   per-process session token for state changes; the token is injected into the
+   served page only.
+
+## Defects discovered during the fixes
+
+`label=No` resolving to the "Notice period" field (substring label matching);
+the sponsorship radio being *unchecked* because an option's text was passed
+where a boolean was expected; the session token being unreadable in the browser
+because the server replaced the property name along with the value; `json` used
+without an import in the demo ATS; repeated demo clicks deduping into one
+application; and the runner submitting from whichever page the previous
+iteration left loaded.
+
+## Verification
+
+| what | result |
+|---|---|
+| `pytest tests/` per module | 141 passed, 0 failed (10 + 12 + 40 + 23 + 9 + 13 + 9 + 25) |
+| `npx vitest run` (frontend) | 7 passed |
+| `npm run build` + `tsc --noEmit` | clean |
+| `uv build --wheel` | `applyops/web/index.html` + assets present |
+| `ruff check src tools tests` | 138 findings, all pre-existing (baseline 143) |
+
+Single-process runs of the whole suite are still killed by this sandbox's
+memory cap once enough headless Chromes accumulate; per-module runs are stable
+and that is how the numbers above were produced.
+
+## Remaining, unresolved
+
+1. Host/Origin/token protection is present but there is still no user
+   authentication -- on a single-user machine there is nobody to authenticate
+   against, and this remains the first beta item.
+2. `cron_apply.py` / `auto_apply.py` still run the legacy flow; the runner does
+   not replace them yet.
+3. Only the demo ATS and LinkedIn Easy Apply have a submission path; other
+   platforms remain read/discover + manual finish.
+4. `prepare` matches fields by a fixed label map plus the sponsorship rule; a
+   real ATS with unusual labels will park applications for a human rather than
+   guess, which is intended but will need per-route label knowledge to be
+   pleasant.
+5. The UI polls every 5 seconds; no SSE yet.

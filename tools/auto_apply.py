@@ -825,23 +825,23 @@ async def apply_one(driver: Driver, job: dict, ledger: Ledger, pending: list[dic
         if any("resume" in l for l in labels) and not any(
             "deselect resume" in l for l in labels
         ):
-                up = await driver.call(
-                    "upload_file",
-                    ref="css=input[type=file]",
-                    file_path=str(resume_path),
-                    role="resume_upload",
-                    reason="no resume selected on this posting",
-                )
-        entry["notes"].append(
-            f"resume attached: {up.get('verification')} "
-            f"({up.get('attachments') or 'no file reported'})"
-        )
-        if up.get("resume_match") is False:
-            entry["notes"].append(
-                f"resume mismatch: {up.get('resume_detail') or 'unknown reason'}"
+            up = await driver.call(
+                "upload_file",
+                ref="css=input[type=file]",
+                file_path=str(resume_path),
+                role="resume_upload",
+                reason="no resume selected on this posting",
             )
-            await asyncio.sleep(3.0)
-            continue
+            entry["notes"].append(
+                f"resume attached: {up.get('verification')} "
+                f"({up.get('attachments') or 'no file reported'})"
+            )
+            if up.get("resume_match") is False:
+                entry["notes"].append(
+                    f"resume mismatch: {up.get('resume_detail') or 'unknown reason'}"
+                )
+                await asyncio.sleep(3.0)
+                continue
 
         # Anything required and still unanswered needs an answer we can defend.
         blockers = [f for f in fields if f.get("required") and is_blank(f)]

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, Application, Attempt, STATE_LABELS } from "../api";
+import { browserGrantStorage, forgetGrant, readGrant } from "../grants";
 
 interface Detail {
   application: Application;
@@ -32,10 +33,13 @@ export function ApplicationsPage({ onChanged }: { onChanged: () => void }) {
     setMessage("");
     try {
       const res = await api.prepare(id);
-      if (res.blocked) {
-        setMessage(`被挡住了：${res.detail}`);
+      if (res.state === "waiting_for_input") {
+        setMessage(
+          `还不能提交，缺：${(res.missing ?? []).join("、") || res.detail || "未说明"}。` +
+            "到「待我处理」页补充后点「重新准备」。"
+        );
       } else {
-        setMessage("表单已读取，等待你在「待我处理」页批准。");
+        setMessage("表单已填好并通过读回验证，等待你在「待我处理」页批准。");
       }
       reload();
       onChanged();
@@ -44,7 +48,7 @@ export function ApplicationsPage({ onChanged }: { onChanged: () => void }) {
     }
   };
 
-  const submit = async (id: string, grantId: string) => {
+  const submit = async (id: string, grantId: string): Promise<boolean> => {
     setError("");
     setMessage("");
     try {
@@ -54,10 +58,14 @@ export function ApplicationsPage({ onChanged }: { onChanged: () => void }) {
           ? `已确认提交成功 —— ${res.detail}`
           : `结果：${res.status} —— ${res.detail}`
       );
-      reload();
+      await reload();
       onChanged();
+      return true;
     } catch (err) {
+      // Expired, used, or bound elsewhere: all three land here, and all three
+      // mean "ask for a fresh approval", not "try again".
       setError(String((err as Error).message ?? err));
+      return false;
     }
   };
 
@@ -81,17 +89,16 @@ export function ApplicationsPage({ onChanged }: { onChanged: () => void }) {
                 <button
                   data-testid={`submit-${a.id}`}
                   onClick={async () => {
-                    // 找这张申请最新一条待批准请求对应的 grant（由你批准时保存在本浏览器）。
-                    const grantEntries = Object.keys(localStorage)
-                      .filter((k) => k.startsWith("applyops-grant:"))
-                      .map((k) => localStorage.getItem(k) ?? "")
-                      .filter((v) => v !== "");
-                    const grantId = grantEntries.length > 0 ? grantEntries[0] : "";
-                    if (!grantId) {
-                      setMessage("还没有批准记录 —— 先到「待我处理」页批准。");
+                    // The grant for THIS application, by construction. A grant
+                    // approved for another posting is not reachable from here --
+                    // that is what the application-id key buys.
+                    const record = readGrant(browserGrantStorage(), a.id);
+                    if (!record) {
+                      setMessage("这张申请还没有批准记录 —— 先到「待我处理」页批准。");
                       return;
                     }
-                    await submit(a.id, grantId);
+                    const ok = await submit(a.id, record.grantId);
+                    if (ok) forgetGrant(browserGrantStorage(), a.id);
                   }}
                 >
                   提交

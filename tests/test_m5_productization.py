@@ -121,10 +121,18 @@ def test_stop_is_safe_when_nothing_is_running():
 
 
 def test_stop_only_touches_its_own_pid_file():
+    """A record naming a port where no console answers is not ours to signal."""
     root = _tmp()
-    (root / "ui.pid").write_text("999999999", encoding="utf-8")
+    (root / "ui.pid").write_text(
+        json.dumps({"pid": 999999999, "port": 1}), encoding="utf-8"
+    )
+    assert stop(root) == 1  # nothing answered, so the pid was left alone
+    assert not (root / "ui.pid").exists()  # and the stale record is cleaned up
+
+    # A file that cannot even be parsed is stale too.
+    (root / "ui.pid").write_text("not-json", encoding="utf-8")
     assert stop(root) == 0
-    assert not (root / "ui.pid").exists()  # stale file cleaned up
+    assert not (root / "ui.pid").exists()
 
 
 def test_console_script_is_registered():
@@ -167,7 +175,10 @@ async def test_clean_machine_onboarding_reaches_verified_result():
 
     # 2. The user completes setup through the console (the API the UI drives).
     app = create_app(root, headless=True)
-    with TestClient(app) as client:
+    # The console page carries the session token; a client acting as that page
+    # has to send it on every state change.
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        client.headers.update({"X-ApplyOps-Token": app.state.applyops.session_token})
         client.post("/api/profile", json=dict(SYNTHETIC_PROFILE))
         payload = write_sample_resume(root / "resume.pdf").read_bytes()
         client.post("/api/resumes", files={"file": ("resume.pdf", payload, "application/pdf")})
@@ -177,16 +188,26 @@ async def test_clean_machine_onboarding_reaches_verified_result():
             assert doctor(root) == 0
         assert "Everything checks out" in report.getvalue()
 
-        # 3. Demo job -> prepare -> approve -> submit -> verified.
+        # 3. Demo job -> prepare (which fills) -> answer what is missing ->
+        #    prepare again -> approve -> submit -> verified.
         demo = client.post("/api/demo/start").json()
         app_id = demo["application"]["id"]
         prepared = client.post(f"/api/applications/{app_id}/prepare").json()
-        assert prepared["state"] == "waiting_for_approval"
+        if prepared["state"] == "waiting_for_input":
+            # The demo form asks for a notice period, which nothing knows yet.
+            assert prepared["missing"]
+            client.post(
+                f"/api/applications/{app_id}/answer",
+                json={"question": prepared["missing"][0], "answer": "Two weeks"},
+            )
+            prepared = client.post(f"/api/applications/{app_id}/prepare").json()
+        assert prepared["state"] == "waiting_for_approval", prepared
+
         approved = client.post(f"/api/requests/{prepared['request_id']}/approve").json()
         outcome = client.post(
             f"/api/applications/{app_id}/submit", json={"grant_id": approved["grant_id"]}
         ).json()
-        assert outcome["status"] == "verified"
+        assert outcome["status"] == "verified", outcome
 
         # 4. History shows the real record.
         detail = client.get(f"/api/applications/{app_id}").json()

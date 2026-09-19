@@ -180,10 +180,27 @@ def test_policy_defaults_to_disabled_and_stays_bounded():
 
 
 def _service_with_resume(root: Path, *, with_resume: bool = True) -> ApplicationService:
+    """A service whose profile is complete enough to fill the demo form.
+
+    The runner fills before it asks for approval, so a profile with only a
+    resume path now parks every application -- which is the correct behaviour
+    and would make these tests assert the wrong thing.
+    """
     service = _service(root)
     if with_resume:
         resume = write_sample_resume(root / "resume.pdf")
-        service.memory.update_profile({"resume_path": str(resume)})
+        service.memory.update_profile(
+            {
+                "name": "Jane Doe",
+                "email": "jane@example.com",
+                "phone": "+1 555 010 4477",
+                "years_experience": "4",
+                "requires_sponsorship": "no",
+                "resume_path": str(resume),
+            }
+        )
+        # The one thing the profile does not know, answered once.
+        service.answers.set_answer("Notice period", "Two weeks")
     return service
 
 
