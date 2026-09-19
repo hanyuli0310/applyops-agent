@@ -17,13 +17,22 @@ import asyncio
 import random
 import sys
 from pathlib import Path
-from typing import Optional
 
 from playwright.async_api import BrowserContext, Locator, Page, async_playwright
 from pydantic import BaseModel, Field
 
 from . import locator
+from .action_policy import TargetFacts
 from .locator import FieldControl
+from .verification import (
+    ObservedFile,
+    Outcome,
+    Verification,
+    verify_boolean_state,
+    verify_choice,
+    verify_text_value,
+    verify_upload,
+)
 
 # Chrome is the only browser we support: the session-import helper depends on
 # its cookie encryption, and it is what most users actually browse in.
@@ -51,10 +60,31 @@ class ClickResult(BaseModel):
 
 
 class FillResult(BaseModel):
+    """Outcome of typing into a field.
+
+    `verification` is the load-bearing field; `ok` is derived from it.
+
+    Three-valued on purpose -- see `applyops.verification`. `readback` keeps the
+    raw value so a mismatch is *diagnosable* rather than merely reported: seeing
+    "150000" come back as "150" is what tells the operator the page truncated it.
+    """
+
     ok: bool = False
-    readback: str = ""  # what the page reports the value to be
+    readback: str | None = None  # what the page reports; None when unreadable
     mismatch: bool = False
     error: str = ""
+    verification: str = Verification.UNVERIFIABLE.value
+    detail: str = ""
+
+    @classmethod
+    def from_verification(cls, outcome: Outcome) -> FillResult:
+        return cls(
+            ok=outcome.ok,
+            readback=outcome.observed,
+            mismatch=outcome.verification is Verification.MISMATCH,
+            verification=outcome.verification.value,
+            detail=outcome.detail,
+        )
 
 
 class SelectResult(BaseModel):
@@ -62,6 +92,82 @@ class SelectResult(BaseModel):
     strategy: str = ""  # native_select | custom_control | option_text
     selected: str = ""
     error: str = ""
+    verification: str = Verification.UNVERIFIABLE.value
+    detail: str = ""
+    readback: str | None = None
+
+    @classmethod
+    def from_verification(
+        cls, outcome: Outcome, *, strategy: str = "", error: str = ""
+    ) -> SelectResult:
+        return cls(
+            ok=outcome.ok,
+            strategy=strategy,
+            selected=outcome.observed or "",
+            error=error,
+            verification=outcome.verification.value,
+            detail=outcome.detail,
+            readback=outcome.observed,
+        )
+
+
+class CheckResult(BaseModel):
+    """A checkbox action, verified against its own checked state."""
+
+    ok: bool = False
+    checked: bool | None = None
+    requested: bool = False
+    error: str = ""
+    verification: str = Verification.UNVERIFIABLE.value
+    detail: str = ""
+
+    @classmethod
+    def from_verification(
+        cls, outcome: Outcome, *, requested: bool, error: str = ""
+    ) -> CheckResult:
+        observed = None if outcome.observed is None else outcome.observed == "True"
+        return cls(
+            ok=outcome.ok,
+            checked=observed,
+            requested=requested,
+            error=error,
+            verification=outcome.verification.value,
+            detail=outcome.detail,
+        )
+
+
+class UploadResult(BaseModel):
+    """A file upload, verified against what the page says it holds.
+
+    `attachments` is what the input reported *after* the upload, which is the
+    only thing that distinguishes "attached" from "the page was already holding
+    some other file".
+    """
+
+    ok: bool = False
+    path: str = ""
+    error: str = ""
+    verification: str = Verification.UNVERIFIABLE.value
+    detail: str = ""
+    attachments: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def from_verification(
+        cls,
+        outcome: Outcome,
+        *,
+        path: str = "",
+        error: str = "",
+        attachments: list[str] | None = None,
+    ) -> UploadResult:
+        return cls(
+            ok=outcome.ok,
+            path=path,
+            error=error,
+            verification=outcome.verification.value,
+            detail=outcome.detail,
+            attachments=attachments or [],
+        )
 
 
 class TabInfo(BaseModel):
@@ -104,8 +210,8 @@ class BrowserController:
         self.headless = headless
         self.channel = channel
         self._playwright = None
-        self._context: Optional[BrowserContext] = None
-        self._page: Optional[Page] = None
+        self._context: BrowserContext | None = None
+        self._page: Page | None = None
         self._user_data_dir = Path(
             user_data_dir or Path(__file__).parent.parent.parent / "data" / "browser-profile"
         )
@@ -355,18 +461,10 @@ class BrowserController:
         except Exception as exc:
             return FillResult(ok=False, error=f"typing failed: {exc}")
 
-        readback = ""
-        try:
-            readback = (await element.input_value(timeout=3000)) or ""
-        except Exception:
-            # Not an <input>; treat a contenteditable's text as the read-back.
-            try:
-                readback = (await element.inner_text()) or ""
-            except Exception:
-                readback = ""
-
-        mismatch = bool(readback) and readback.strip() != value.strip()
-        return FillResult(ok=not mismatch, readback=readback, mismatch=mismatch)
+        readback, readable = await _read_element_value(element)
+        return FillResult.from_verification(
+            verify_text_value(value, readback, readable=readable)
+        )
 
     async def select_option(self, ref: str, value: str) -> SelectResult:
         """Choose an option, native `<select>` or a custom dropdown.
@@ -394,12 +492,18 @@ class BrowserController:
         except Exception:
             pass
 
-        # Phase 1 -- a real <select>.
+        # Phase 1 -- a real <select>. Selecting is not the end of it: the choice
+        # has to be read back, because a <select> whose option list is rebuilt
+        # from a stale request can silently snap to its first entry.
         if tag == "select":
             for kwargs in ({"label": value}, {"value": value}):
                 try:
                     await element.select_option(timeout=5000, **kwargs)
-                    return SelectResult(ok=True, strategy="native_select", selected=value)
+                    observed, readable = await _read_element_value(element)
+                    return SelectResult.from_verification(
+                        verify_choice(value, observed, readable=readable),
+                        strategy="native_select",
+                    )
                 except Exception:
                     continue
 
@@ -449,10 +553,10 @@ class BrowserController:
                         option = candidate.nth(index)
                         if await option.is_visible():
                             await option.click(timeout=5000)
-                            return SelectResult(
-                                ok=True,
+                            observed, readable = await _read_element_value(element)
+                            return SelectResult.from_verification(
+                                verify_choice(query, observed, readable=readable),
                                 strategy="custom_control",
-                                selected=query,
                             )
                 except Exception:
                     continue
@@ -462,36 +566,64 @@ class BrowserController:
             await self.page.keyboard.press("Escape")
         except Exception:
             pass
-        return SelectResult(ok=False, error=f"no visible option matched {value!r} (role={role})")
+        return SelectResult.from_verification(
+            Outcome(
+                Verification.MISMATCH,
+                value,
+                None,
+                f"no visible option matched {value!r} (role={role})",
+            )
+        )
 
-    async def set_checkbox(self, ref: str, checked: bool = True) -> bool:
+    async def set_checkbox(self, ref: str, checked: bool = True) -> CheckResult:
         """Check or uncheck a control, tolerating a label-level reference.
 
         Radio groups often have framework-generated ids, so `locator` addresses
         them by label text. That resolves to the label rather than the input, and
         clicking a label still toggles the control it belongs to.
+
+        The state is read back afterwards. A checkbox is the cheapest control in
+        the DOM to verify -- `is_checked()` answers definitively -- so there is no
+        excuse for reporting success on an action that was merely attempted.
         """
         try:
             element = await self._resolve(ref)
-        except Exception:
-            return False
+        except Exception as exc:
+            return CheckResult.from_verification(
+                Outcome(Verification.UNVERIFIABLE, str(checked), None, str(exc)),
+                requested=checked,
+                error=str(exc),
+            )
 
-        try:
-            current = await element.is_checked()
-        except Exception:
+        current = await _read_checked_state(element)
+        if current is None:
+            # Cannot read it; still try the click, then re-read. Never assume.
             try:
                 await element.click(timeout=8000)
-                return True
-            except Exception:
-                return False
+            except Exception as exc:
+                return CheckResult.from_verification(
+                    Outcome(Verification.UNVERIFIABLE, str(checked), None, f"click failed: {exc}"),
+                    requested=checked,
+                    error=str(exc),
+                )
+        elif current != checked:
+            try:
+                await element.click(timeout=8000)
+            except Exception as exc:
+                return CheckResult.from_verification(
+                    Outcome(Verification.UNVERIFIABLE, str(checked), None, f"click failed: {exc}"),
+                    requested=checked,
+                    error=str(exc),
+                )
+        else:
+            return CheckResult.from_verification(
+                verify_boolean_state(checked, current), requested=checked
+            )
 
-        if current == checked:
-            return True
-        try:
-            await element.click(timeout=8000)
-            return True
-        except Exception:
-            return False
+        observed = await _read_checked_state(element)
+        return CheckResult.from_verification(
+            verify_boolean_state(checked, observed), requested=checked
+        )
 
     async def click(self, ref: str = "", name: str = "") -> ClickResult:
         """Click an element, following a new tab if one opens.
@@ -517,13 +649,169 @@ class BrowserController:
         new_tab = await self._adopt_new_tabs(pages_before)
         return ClickResult(clicked=True, new_tab=new_tab, active_url=self.page.url)
 
-    async def upload_file(self, ref: str, file_path: str) -> bool:
+    async def upload_file(self, ref: str, file_path: str) -> UploadResult:
+        """Attach a file, then confirm the page actually holds *that* file.
+
+        `set_input_files` returning cleanly is not proof: the input already had
+        files, the change event was swallowed by the framework, or the form
+        re-populated its previous attachment. Reading the input's `FileList`
+        afterwards is the only evidence there is, and an empty `FileList` means
+        unverifiable rather than fine.
+        """
+        path = Path(file_path)
+        expected_size: int | None = None
+        try:
+            expected_size = path.stat().st_size
+        except OSError:
+            expected_size = None
+
         try:
             element = await self._resolve(ref)
             await element.set_input_files(file_path, timeout=15000)
-            return True
+        except Exception as exc:
+            return UploadResult.from_verification(
+                Outcome(Verification.UNVERIFIABLE, path.name, None, f"upload failed: {exc}"),
+                path=str(path),
+                error=str(exc),
+            )
+
+        await asyncio.sleep(0.3)  # give the page a beat to run its change handler
+        observed, readable = await _read_attachments(element)
+        outcome = verify_upload(
+            path.name,
+            observed if readable else None,
+            readable=readable,
+            expected_size=expected_size,
+        )
+        return UploadResult.from_verification(
+            outcome,
+            path=str(path),
+            attachments=[f.name for f in (observed or [])],
+        )
+
+    async def read_attachments(self, ref: str) -> tuple[list[ObservedFile], bool]:
+        """What a file input currently holds, without touching it.
+
+        Used to answer "is the resume already on this form ours?". A page that
+        arrives carrying an attachment is the normal case on LinkedIn, and an
+        attachment we did not put there must not be trusted as the user's choice.
+        """
+        try:
+            element = await self._resolve(ref)
         except Exception:
-            return False
+            return [], False
+        return await _read_attachments(element)
+
+    async def inspect_target(self, ref: str = "", name: str = "") -> tuple[TargetFacts | None, str]:
+        """Learn what a click target actually *is*, before deciding anything.
+
+        Both signals `action_policy` needs are gathered here. The structural one
+        matters most: a `<button>` with no `type` inside a form submits that form
+        in every browser, whatever its label says.
+        """
+        try:
+            if ref:
+                element = await self._resolve(ref)
+            elif name:
+                element = await locator.find_button(self.page, name)
+                if element is None:
+                    return None, f"no visible button or link named {name!r}"
+            else:
+                return None, "click requires either ref or name"
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+
+        try:
+            facts = await element.evaluate(
+                """el => {
+                    const form = el.closest ? el.closest('form') : el.form;
+                    const tag = el.tagName.toLowerCase();
+                    const type = (el.getAttribute('type') || '').toLowerCase();
+                    const submits =
+                        !!form &&
+                        ((tag === 'input' && (type === 'submit' || type === 'image')) ||
+                         (tag === 'button' && type !== 'button' && type !== 'reset'));
+                    const text = (el.textContent || '').trim();
+                    return {
+                        tag,
+                        input_type: type,
+                        role: el.getAttribute('role') || '',
+                        submits_form: submits,
+                        href: el.getAttribute('href') || '',
+                        value_attr: el.getAttribute('value') || el.value || '',
+                        name: el.getAttribute('aria-label') || text || el.getAttribute('value') || '',
+                    };
+                }"""
+            )
+        except Exception as exc:
+            return None, f"could not inspect target: {exc}"
+
+        facts = dict(facts or {})
+        if not facts.get("name"):
+            facts["name"] = name
+        if ref and not facts.get("name"):
+            facts["name"] = facts.get("value_attr", "")
+        return (
+            TargetFacts(
+                name=(facts.get("name") or "").strip()[:200],
+                tag=facts.get("tag", ""),
+                input_type=facts.get("input_type", ""),
+                role=facts.get("role", ""),
+                submits_form=bool(facts.get("submits_form")),
+                href=facts.get("href", ""),
+                ref=ref,
+            ),
+            "",
+        )
+
+    async def field_snapshot(self) -> dict[str, str]:
+        """Every answerable field on the page with the value it currently holds.
+
+        This is the snapshot a grant binds to. It comes from the DOM, not from
+        what an agent believes it typed: the values here are what the form would
+        actually send, which is exactly the thing being approved.
+
+        A field the page will not let us read is reported as `<unreadable>`
+        rather than skipped, so approving a form containing one is a conscious
+        decision instead of a gap in the listing.
+        """
+        snapshot: dict[str, str] = {}
+        try:
+            fields = await locator.resolve_fields(self.page)
+        except Exception:
+            return snapshot
+
+        for control in fields:
+            key = control.label or control.element_id or control.ref
+            try:
+                element = await locator.resolve_ref(self.page, control.ref)
+            except Exception:
+                snapshot[key] = "<unresolvable>"
+                continue
+            value, readable = await _read_element_value(element)
+            if not readable or value is None:
+                snapshot[key] = "<unreadable>"
+            else:
+                snapshot[key] = value
+        return snapshot
+
+    async def page_indicates(self, patterns: list[str]) -> tuple[bool, str]:
+        """Whether the current page says the submission succeeded.
+
+        Returns a tuple so "no evidence" stays distinguishable from "the page
+        says no": only a positive match counts as verification.
+        """
+        for pattern in patterns:
+            needle = (pattern or "").strip()
+            if not needle:
+                continue
+            try:
+                found = self.page.get_by_text(needle, exact=False)
+                if await found.count() > 0:
+                    return True, needle
+            except Exception:  # noqa: BLE001, S112 - a page read can fail many ways; unreadable is the answer either way
+                continue
+        return False, ""
 
     # ── scrolling / waiting ──────────────────────────────────────────
 
@@ -535,7 +823,7 @@ class BrowserController:
     async def wait_for_navigation(self, timeout: float = 10.0):
         try:
             await self.page.wait_for_load_state("domcontentloaded", timeout=timeout * 1000)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - a page read can fail many ways; unreadable is the answer either way
             pass
 
     async def wait_for_selector(self, selector: str, timeout: float = 10.0):
@@ -556,6 +844,84 @@ class BrowserController:
                 return last
             await asyncio.sleep(poll)
         return last
+
+
+_READ_VALUE_JS = """el => {
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    if (tag === 'select') {
+        const option = el.options[el.selectedIndex];
+        return option ? (option.text || option.value || '') : '';
+    }
+    if (tag === 'input' && (type === 'checkbox' || type === 'radio')) {
+        return el.checked ? 'checked' : 'unchecked';
+    }
+    if (tag === 'input' || tag === 'textarea') return String(el.value ?? '');
+    if (el.isContentEditable) return String(el.innerText ?? '');
+    return String(el.getAttribute('aria-valuetext') || el.innerText || '').trim();
+}"""
+
+
+async def _read_element_value(element: Locator) -> tuple[str | None, bool]:
+    """Read a control's current value. Returns (value, readable).
+
+    `readable` is False only when every strategy failed. A value that read fine
+    and came back empty is `(None, True)`'s opposite: `("", True)` -- and those
+    two must never be conflated, which is the whole point of `verification`.
+    """
+    try:
+        value = await element.evaluate(_READ_VALUE_JS)
+        return value if value is not None else "", True
+    except Exception:  # noqa: BLE001 - a page read can fail many ways; unreadable is the answer either way
+        try:
+            return await element.input_value(timeout=2000), True
+        except Exception:  # noqa: BLE001 - a page read can fail many ways; unreadable is the answer either way
+            return None, False
+
+
+async def _read_checked_state(element: Locator) -> bool | None:
+    """Read a checkbox/radio's state, following a `<label>` back to its control."""
+    try:
+        state = await element.evaluate(
+            """el => {
+                let target = el;
+                const tag = el.tagName.toLowerCase();
+                if (tag === 'label') {
+                    target = el.control
+                        || (el.htmlFor ? document.getElementById(el.htmlFor) : null)
+                        || el.querySelector('input');
+                }
+                if (!target || !target.tagName) return null;
+                const type = (target.getAttribute('type') || '').toLowerCase();
+                if (type === 'checkbox' || type === 'radio') return !!target.checked;
+                const pressed = target.getAttribute('aria-pressed');
+                if (pressed !== null) return pressed === 'true';
+                const checked = target.getAttribute('aria-checked');
+                if (checked !== null) return checked === 'true';
+                return null;
+            }"""
+        )
+        return bool(state) if state is not None else None
+    except Exception:  # noqa: BLE001 - a page read can fail many ways; unreadable is the answer either way
+        return None
+
+
+async def _read_attachments(element: Locator) -> tuple[list[ObservedFile], bool]:
+    """The `FileList` a file input currently holds."""
+    try:
+        payload = await element.evaluate(
+            """el => {
+                const tag = el.tagName.toLowerCase();
+                const type = (el.getAttribute('type') || '').toLowerCase();
+                if (tag !== 'input' || type !== 'file') return null;
+                return Array.from(el.files || []).map(f => ({name: f.name, size: f.size}));
+            }"""
+        )
+    except Exception:  # noqa: BLE001 - a page read can fail many ways; unreadable is the answer either way
+        return [], False
+    if payload is None:
+        return [], False  # not a file input: there is no FileList to read
+    return [ObservedFile(name=str(item.get("name", "")), size=item.get("size")) for item in payload], True
 
 
 def _select_all_shortcut() -> str:

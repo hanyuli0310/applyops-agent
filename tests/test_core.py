@@ -485,7 +485,12 @@ def test_route_knowledge():
 
         # 3. A real attempt votes through add_application. A route that is only
         #    ever reported when it breaks would read as one that never succeeds,
-        #    so the outcome is counted on the same path as the platform's.
+        #    so the outcome is counted on the same path as the platform's -- but
+        #    only once it is actually *verified*.
+        #
+        #    M1: `applied` used to be counted as success, which made a route whose
+        #    submissions were never confirmed indistinguishable from one nobody had
+        #    any doubt about. The attempt still counts; its outcome is what is weak.
         store.add_application(
             job_url="https://www.amazon.jobs/en/jobs/10529830",
             job_title="Software Development Engineer, Early Career",
@@ -495,8 +500,22 @@ def test_route_knowledge():
             status="applied",
         )
         amazon = store.get_route("Amazon", "external_ats")
-        assert (amazon.runs, amazon.successes) == (1, 1)
-        assert amazon.success_rate == 1.0
+        assert (amazon.runs, amazon.successes) == (1, 0)
+        assert amazon.success_rate == 0.0
+
+        # 3b. Only a confirmed result may be counted as one.
+        store.add_application(
+            job_url="https://www.amazon.jobs/en/jobs/10529831",
+            job_title="Software Development Engineer",
+            company="Audible",
+            platform="Amazon",
+            apply_route="external_ats",
+            status="applied",
+            outcome="verified",
+        )
+        amazon = store.get_route("Amazon", "external_ats")
+        assert (amazon.runs, amazon.successes) == (2, 1)
+        assert amazon.success_rate == 0.5
 
         # 4. A blockage names the step, which is the sentence an adapter gets
         #    written from -- and it accumulates rather than overwriting.
@@ -513,7 +532,8 @@ def test_route_knowledge():
         #    actually been run -- re-seeding on top of measured history is the
         #    same mistake as resetting a learned answer to its default.
         reloaded = MemoryStore(path).get_route("Amazon", "external_ats")
-        assert reloaded.runs == 1
+        assert reloaded.runs == 2  # both attempts above survived the reload
+        assert reloaded.successes == 1  # only the verified one counted
         assert reloaded.blocked_at["sign-in wall"] == 2
         assert reloaded.notes == "code never arrived"
 
@@ -527,7 +547,7 @@ def test_route_knowledge():
         # 7. The flywheel reports routes next to platforms, because a platform
         #    can look healthy while its only ever-run route is the easy one.
         routes = {r["route"]: r for r in store.get_stats()["routes"]}
-        assert routes["Amazon/external_ats"]["runs"] == 1
+        assert routes["Amazon/external_ats"]["runs"] == 2
         assert routes["Amazon/external_ats"]["hardest_gate"] == "sign-in wall"
         assert routes["LinkedIn/easy_apply"]["runs"] == 0
 

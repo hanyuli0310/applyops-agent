@@ -386,6 +386,15 @@ class ApplicationRecord(BaseModel):
     ats: str = ""  # greenhouse | lever | workday | ... "" for native apply
     apply_route: str = ""  # easy_apply | external | unknown
     status: str = "applied"  # applied, failed, paused, unknown
+    # How sure we are that anything reached the employer:
+    #   verified   -- the page confirmed it
+    #   unverified -- sent, possibly received, never confirmed
+    #   failed     -- never sent, or the page rejected it
+    # Defaults to the *weakest* claim. Guessing upward ("it probably worked")
+    # is how a failed run becomes a confident number in someone's stats.
+    outcome: str = "unverified"
+    grant_id: str = ""  # the one-time authorization that allowed the final submit
+    resume_sha256: str = ""  # which file actually went out
     applied_at: str = Field(default_factory=_now)
     notes: str = ""
     answers_used: list[str] = Field(default_factory=list)  # QA ids
@@ -1456,7 +1465,17 @@ class MemoryStore:
         ats: str = "",
         apply_route: str = "",
         vision_fallbacks: int = 0,
+        outcome: str = "unverified",
+        grant_id: str = "",
+        resume_sha256: str = "",
     ) -> ApplicationRecord:
+        """Record an application attempt.
+
+        `outcome` is what the statistics count, and it defaults to
+        `unverified`: being *sent* is the default state of uncertainty, and it
+        is never evidence of being *received*. Only `execute_authorized_submission`
+        reporting `verified` may pass anything stronger.
+        """
         record = ApplicationRecord(
             job_url=job_url,
             job_id=job_id or extract_job_id(job_url),
@@ -1470,15 +1489,22 @@ class MemoryStore:
             answers_used=answers_used or [],
             vision_fallbacks=vision_fallbacks,
             steps=steps,
+            outcome=outcome,
+            grant_id=grant_id,
+            resume_sha256=resume_sha256,
         )
         self._data.application_history.append(record)
 
         # ---- attribution: this is what makes the wheel spin ----
-        succeeded = status in ("success", "applied")
+        # Success is counted from `outcome`, never from `status`. The old rule
+        # counted anything not explicitly failed, which meant a run whose result
+        # was never confirmed looked identical to a confirmed one -- and made the
+        # success rate a number nobody could act on.
+        verified = outcome == "verified"
         if platform:
             pk = self.get_platform(platform)
             pk.runs += 1
-            if succeeded:
+            if verified:
                 pk.successes += 1
         if apply_route:
             # The same outcome also votes on how the application was *routed*.
@@ -1487,10 +1513,10 @@ class MemoryStore:
             # reported when it fails would read as one that never succeeds.
             routed = self.get_route(platform or "Generic", apply_route)
             routed.runs += 1
-            if succeeded:
+            if verified:
                 routed.successes += 1
         for qa_id in record.answers_used:
-            self.record_answer_outcome(qa_id, succeeded)
+            self.record_answer_outcome(qa_id, verified)
 
         self._save()
         return record

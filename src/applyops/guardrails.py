@@ -91,6 +91,7 @@ class GuardState(BaseModel):
     last_application_at: str = ""
     consecutive_failures: int = 0
     halted_reason: str = ""
+    last_unverified_note: str = ""
     confirmations: dict[str, Confirmation] = Field(default_factory=dict)
     # A deliberate, human-made exception to the daily cap, valid for exactly one
     # day. Recorded with its provenance so that "why was this day different"
@@ -434,6 +435,28 @@ class Guardrails:
                         + (f": {note}" if note else "")
                     )
 
+    def record_unverified(self, note: str = "") -> None:
+        """Spend a slot on a submission whose result was never confirmed.
+
+        Two properties, and they pull apart deliberately:
+
+        - **It consumes quota.** The form was submitted; whether the employer has
+          it is unknown, and pretending the slot is still free would let an
+          unconfirmed result pay for another attempt.
+        - **It does not reset the breaker.** An unconfirmed outcome is not
+          evidence that whatever was failing has started working, so it does not
+          clear the failure count. Only a verified success does that.
+
+        Recording it as a success would make the "successes so far" number
+        untrue; recording it as a failure would halt runs whose submissions were
+        probably fine. Unverified is its own thing.
+        """
+        with self._transaction():
+            self._state.last_application_at = _now().isoformat()
+            self._state.applied_today += 1
+            if note:
+                self._state.last_unverified_note = note
+
     def reset_halt(self):
         """Clear a tripped breaker so a human can resume deliberately."""
         with self._transaction():
@@ -463,5 +486,6 @@ class Guardrails:
             "halted": bool(self._state.halted_reason),
             "halted_reason": self._state.halted_reason,
             "last_application_at": self._state.last_application_at,
+            "last_unverified_note": self._state.last_unverified_note,
             "min_gap_seconds": list(self.min_gap),
         }

@@ -33,13 +33,28 @@ this profile", and that question is only ever asked in the launch branch.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Optional
 
 from .. import concurrency
+from ..authorization import SubmissionAuthorizer
 from ..browser import BrowserController
 from ..guardrails import Guardrails
 from ..memory import MemoryStore
+
+# Where this machine's state lives. Overridable so tests (and later a packaged
+# install) can point at a directory the user chose, rather than at whatever the
+# package happens to be installed inside.
+DATA_DIR_ENV = "APPLYOPS_DATA_DIR"
+
+
+def default_data_dir() -> Path:
+    """`APPLYOPS_DATA_DIR`, else `<repo>/data`."""
+    override = os.environ.get(DATA_DIR_ENV)
+    if override:
+        return Path(override).expanduser()
+    return Path(__file__).parent.parent.parent.parent / "data"
 
 # Domain -> platform label. Kept here rather than in `platforms/detector.py`
 # because this is about *naming the flywheel bucket*, not about deciding how to
@@ -99,10 +114,15 @@ class Runtime:
     """Holds the long-lived objects the tools operate on."""
 
     def __init__(self, data_dir: Optional[Path] = None):
-        root = data_dir or (Path(__file__).parent.parent.parent.parent / "data")
+        root = data_dir or default_data_dir()
         self.data_dir = Path(root)
         self.memory = MemoryStore(self.data_dir / "memory.json")
         self.guardrails = Guardrails(self.data_dir / "guard_state.json", memory=self.memory)
+        # The authorization boundary for a final external submit. Shared with
+        # whatever else points at this data dir, so the human-facing approval
+        # step and the code that wants permission are necessarily not the same
+        # actor even though they may be the same machine.
+        self.authorizer = SubmissionAuthorizer(self.data_dir)
         self._browser: Optional[BrowserController] = None
         self._lock = asyncio.Lock()
         # Guards `data/browser-profile` against every other process on this

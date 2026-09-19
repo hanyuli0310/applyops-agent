@@ -38,6 +38,7 @@ import asyncio
 import json
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,6 +47,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from applyops import concurrency  # noqa: E402
+from applyops.authorization import SubmissionAuthorizer  # noqa: E402
 from applyops.mcp.server import RUNTIME, build_server  # noqa: E402
 from tools import singlewriter  # noqa: E402
 from tools.attach import session  # noqa: E402
@@ -54,7 +56,13 @@ DATA = PROJECT_ROOT / "data"
 LOG_PATH = DATA / "application_log.json"
 CANDIDATES_PATH = DATA / "candidates.json"
 PENDING_PATH = DATA / "pending_questions.json"
-RESUME_PATH = DATA / "resume.pdf"
+
+# Deliberately No RESUME_PATH constant. The batch runner used to hard-code
+# `data/resume.pdf`, which meant the file it attached could differ from the one
+# configured in the profile while every log line confidently named the hard-coded
+# file. There is now one source of truth: the profile's `resume_path`, resolved
+# per run through `get_profile`.
+RESUME_KEY = "resume_path"
 
 # software / ML / agent -- the three families the user named.
 KEYWORDS = [
@@ -67,6 +75,32 @@ KEYWORDS = [
 ]
 LOCATION = "United States"
 MAX_HOURS = 24.0
+
+# How long a posting will wait for a human to approve its submission request.
+# Deliberately generous -- an unattended run now *waits for a person* instead of
+# approving on their behalf, and a short window would turn that into a silent
+# skip of nearly everything.
+GRANT_WAIT_SECONDS = 900.0
+GRANT_POLL_SECONDS = 3.0
+
+
+async def wait_for_grant(request_id: str, timeout: float = GRANT_WAIT_SECONDS) -> str:
+    """Poll for a human's decision. Returns a grant id, or "" if there is none.
+
+    This is what replaces the runner minting its own permission. It cannot
+    approve, only notice -- which is the entire boundary.
+    """
+    authorizer = SubmissionAuthorizer(DATA)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        request = authorizer.get_request(request_id)
+        if request is not None:
+            if request.status == "approved" and request.grant_id:
+                return request.grant_id
+            if request.status == "rejected":
+                return ""
+        await asyncio.sleep(GRANT_POLL_SECONDS)
+    return ""
 
 
 # --------------------------------------------------------------------------
@@ -691,6 +725,11 @@ async def answer_or_bail(
 async def apply_one(driver: Driver, job: dict, ledger: Ledger, pending: list[dict]) -> dict:
     job_url = job["url"]
     job_id = str(job.get("job_id", ""))
+    # The resume now comes from the profile, resolved once per job. No default:
+    # a missing resume must fail this posting loudly rather than attach whatever
+    # happens to sit at a hard-coded path.
+    profile = await driver.call("get_profile")
+    resume_path = (profile.get("profile") or {}).get(RESUME_KEY) or ""
     entry = {
         "attempted_at": _now(),
         "job_id": job_id,
@@ -712,6 +751,12 @@ async def apply_one(driver: Driver, job: dict, ledger: Ledger, pending: list[dic
     if not pre.get("allowed"):
         entry["outcome"] = "skipped"
         entry["reason"] = pre.get("reason", "preflight refused")
+        log_line(f"  skip {job.get('company')}: {entry['reason']}")
+        return entry
+
+    if not resume_path:
+        entry["outcome"] = "skipped"
+        entry["reason"] = f"no resume configured (set `{RESUME_KEY}` in data/profile.md)"
         log_line(f"  skip {job.get('company')}: {entry['reason']}")
         return entry
 
@@ -782,15 +827,20 @@ async def apply_one(driver: Driver, job: dict, ledger: Ledger, pending: list[dic
                 up = await driver.call(
                     "upload_file",
                     ref="css=input[type=file]",
-                    file_path=str(RESUME_PATH),
+                    file_path=str(resume_path),
                     role="resume_upload",
                     reason="no resume selected on this posting",
                 )
-                entry["notes"].append(
-                    f"resume uploaded: {bool(up.get('uploaded') or up.get('ok'))}"
-                )
-                await asyncio.sleep(3.0)
-                continue
+        entry["notes"].append(
+            f"resume attached: {up.get('verification')} "
+            f"({up.get('attachments') or 'no file reported'})"
+        )
+        if up.get("resume_match") is False:
+            entry["notes"].append(
+                f"resume mismatch: {up.get('resume_detail') or 'unknown reason'}"
+            )
+            await asyncio.sleep(3.0)
+            continue
 
         # Anything required and still unanswered needs an answer we can defend.
         blockers = [f for f in fields if f.get("required") and is_blank(f)]
@@ -848,58 +898,58 @@ async def apply_one(driver: Driver, job: dict, ledger: Ledger, pending: list[dic
         entry["reason"] = "form did not reach a submit control"
         return entry
 
-    summary = (
-        f"{job.get('title')} @ {job.get('company')} ({job.get('location')})\n"
-        f"job id {job_id} - Easy Apply, {entry['steps']} step(s)\n"
-        f"answers taken from memory: {entry['answers_used'] or 'none'}\n"
-        f"resume: data/resume.pdf\n"
-        f"listed: {job.get('listed')}"
+    # ── the final submit ─────────────────────────────────────────────
+    # This used to be `click_target(name="Submit application")` followed by
+    # `submit_application(acknowledged=True)`. The click was the real submission
+    # and it was completely ungated: the token only gated the *bookkeeping* after
+    # the external side effect had already happened. A batch runner additionally
+    # has nobody watching it, so "the user approved" was a constant True.
+    #
+    # Now: open a request bound to the live form, wait for a human to approve it
+    # out-of-band (`python -m applyops.approve <id>`), then hand the resulting
+    # grant to submit_final -- which is the only thing that ever clicks.
+    req = await driver.call(
+        "request_submission_grant", job_url=job_url, job_id=job_id, route="easy_apply"
     )
-    conf = await driver.call(
-        "request_submit_confirmation", summary=summary, job_url=job_url, job_id=job_id
-    )
-    token = conf.get("confirmation_id")
-    if not token:
+    request_id = req.get("request_id")
+    if not request_id:
         entry["outcome"] = "skipped"
-        entry["reason"] = f"no confirmation token: {conf.get('error') or conf}"
+        entry["reason"] = f"no submission request created: {req.get('error') or req}"
         return entry
 
-    clicked = await driver.call(
-        "click_target",
-        name="Submit application",
-        role="modal_submit",
-        reason="batch run authorised by the user",
-    )
-    if not clicked.get("clicked"):
-        entry["outcome"] = "skipped"
-        entry["reason"] = f"Submit did not click: {clicked.get('error')}"
-        entry["notes"].append("token issued but not spent; nothing was recorded")
-        return entry
-    await asyncio.sleep(6.0)
-    # `include_text` is mandatory here: `browser_state` withholds the page text
-    # by default, so checking the confirmation copy without it silently always
-    # reports "unverified" and the check looks like it ran when it never did.
-    after = await driver.call("browser_state", include_text=True)
-    blob = json.dumps(after, ensure_ascii=False).lower()
-    sent = "application was sent" in blob or "application submitted" in blob
+    summary = req.get("summary_to_show", "")
+    print("\n" + summary + "\n", flush=True)
+    entry["request_id"] = request_id
+    log_line(f"  waiting for human approval of request {request_id}")
 
-    rec = await driver.call(
-        "submit_application",
-        confirmation_id=token,
+    grant_id = await wait_for_grant(request_id, timeout=GRANT_WAIT_SECONDS)
+    if not grant_id:
+        entry["outcome"] = "awaiting_approval"
+        entry["reason"] = (
+            "no approval within the wait window; nothing was submitted. Approve "
+            f"with `python -m applyops.approve {request_id}` and retry this posting."
+        )
+        log_line(f"  skip {job.get('company')}: {entry['reason']}")
+        return entry
+
+    outcome = await driver.call(
+        "submit_final",
+        grant_id=grant_id,
         job_url=job_url,
         job_id=job_id,
-        job_title=job.get("title") or "",
-        company=job.get("company") or "",
-        platform="LinkedIn",
-        apply_route="easy_apply",
-        answers_used=entry["answers_used"],
-        steps=entry["steps"],
-        acknowledged=True,
+        route="easy_apply",
     )
-    entry["outcome"] = "submitted" if (sent and not rec.get("error")) else "submitted_unverified"
-    entry["confirmation_id"] = token
-    entry["page_confirmed_sent"] = sent
-    entry["record_error"] = rec.get("error")
+    status = outcome.get("status") or "unverified"
+    entry["confirmation_id"] = grant_id
+    entry["page_verified"] = status == "verified"
+    entry["notes"].append(f"submit_final status: {status}")
+    if outcome.get("error") or outcome.get("reason"):
+        entry["notes"].append(f"submit_final: {outcome.get('error') or outcome.get('reason')}")
+    entry["outcome"] = {
+        "verified": "submitted",
+        "unverified": "submitted_unverified",
+        "failed": "failed",
+    }.get(status, "submitted_unverified")
     return entry
 
 

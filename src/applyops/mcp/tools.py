@@ -27,18 +27,49 @@ structured-content support.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
 from .. import discovery
+from ..action_policy import ClickClass, decide_click
 from ..browser import BrowserController
 from ..memory import extract_job_id
+from ..resume import (
+    ResumeError,
+    ResumeRef,
+    resolve_resume,
+)
+from ..submission import (
+    FinalAction,
+    SubmissionRefused,
+    execute_authorized_submission,
+)
+from ..submission import (
+    reconcile_submission as reconcile_submission_impl,
+)
 from .runtime import BrowserBusy, Runtime, platform_for_url
 
 # A tool call that blocks this long is a bug, not a rate limit.
 MAX_INLINE_WAIT_SECONDS = 300.0
+
+# What a page has to say before we believe an application reached anyone.
+# Per platform because each employer writes a different sentence, and a single
+# global guess would either miss everything or accept anything. Empty means:
+# this route has no verified final action, so its result can only ever be
+# "unknown" -- which is a far better answer than "success".
+SUCCESS_EVIDENCE = {
+    "DemoATS": ("Application received",),
+    "LinkedIn": ("application was sent", "application sent", "successfully applied"),
+    "Greenhouse": ("application submitted", "thanks for applying"),
+    "Lever": ("application submitted", "thanks for applying"),
+    "Workday": ("application submitted", "thank you for applying"),
+}
+
+# The demo ATS is recognised by its own URL, never by guessing at a hostname.
+DEMO_HOSTS = ("127.0.0.1", "localhost")
 
 
 def _json(payload: Any) -> str:
@@ -261,18 +292,22 @@ def register(server: MCPServer, runtime: Runtime) -> None:
         """
         async with runtime.lock:
             browser = await runtime.get_browser()
-            result = await browser.fill_field(ref, value)
-            _record(browser, ref, role, result.ok)
-            return _json(
-                {
-                    "ok": result.ok,
-                    "readback": result.readback,
-                    "mismatch": result.mismatch,
-                    "error": result.error,
-                    "role": role,
-                    "reason": reason,
-                }
-            )
+        # Every failure (unverified included) is still an attempt: the request
+        # may have gone out, so the slot is spent either way.
+        result = await browser.fill_field(ref, value)
+        _record(browser, ref, role, result.ok)
+        return _json(
+            {
+                "ok": result.ok,
+                "verification": result.verification,
+                "readback": result.readback,
+                "mismatch": result.mismatch,
+                "detail": result.detail,
+                "error": result.error,
+                "role": role,
+                "reason": reason,
+            }
+        )
 
     @server.tool()
     async def select_option(ref: str, value: str, role: str, reason: str) -> str:
@@ -283,13 +318,71 @@ def register(server: MCPServer, runtime: Runtime) -> None:
         """
         async with runtime.lock:
             browser = await runtime.get_browser()
-            result = await browser.select_option(ref, value)
+        result = await browser.select_option(ref, value)
+        _record(browser, ref, role, result.ok)
+        return _json(
+            {
+                "ok": result.ok,
+                "verification": result.verification,
+                "selected": result.selected,
+                "readback": result.readback,
+                "detail": result.detail,
+                "strategy": result.strategy,
+                "error": result.error,
+                "role": role,
+                "reason": reason,
+            }
+        )
+
+    @server.tool()
+    async def set_checkbox(ref: str, checked: bool, role: str, reason: str) -> str:
+        """Check or uncheck a checkbox or radio button."""
+        async with runtime.lock:
+            browser = await runtime.get_browser()
+        result = await browser.set_checkbox(ref, checked)
+        _record(browser, ref, role, result.ok)
+        return _json(
+            {
+                "ok": result.ok,
+                "verification": result.verification,
+                "checked": result.checked,
+                "detail": result.detail,
+                "error": result.error,
+                "role": role,
+                "reason": reason,
+            }
+        )
+
+    @server.tool()
+    async def upload_file(ref: str, file_path: str, role: str, reason: str) -> str:
+        """Attach a local file to a file input (typically a resume).
+
+        The reply reports what the input holds *afterwards*, and compares the
+        file against the profile's configured resume. Both matter: an input that
+        still reports nothing is `unverifiable` and must be treated as not
+        attached, and a file that is not the configured resume is either an older
+        revision or somebody else's -- either way it must not go out silently.
+        """
+        async with runtime.lock:
+            browser = await runtime.get_browser()
+            result = await browser.upload_file(ref, file_path)
+
+            comparison = _compare_resume(runtime, file_path)
+            if comparison["mismatch"]:
+                # Still recorded as whatever the page verified: refusing to
+                # upload is not useful, but claiming it is the right file is a lie.
+                result.detail = (result.detail or "") + " " + comparison["detail"]
+
             _record(browser, ref, role, result.ok)
             return _json(
                 {
                     "ok": result.ok,
-                    "strategy": result.strategy,
-                    "selected": result.selected,
+                    "verification": result.verification,
+                    "detail": result.detail,
+                    "attachments": result.attachments,
+                    "resume_match": comparison["match"],
+                    "resume_detail": comparison["detail"],
+                    "path": result.path,
                     "error": result.error,
                     "role": role,
                     "reason": reason,
@@ -297,22 +390,24 @@ def register(server: MCPServer, runtime: Runtime) -> None:
             )
 
     @server.tool()
-    async def set_checkbox(ref: str, checked: bool, role: str, reason: str) -> str:
-        """Check or uncheck a checkbox or radio button."""
-        async with runtime.lock:
-            browser = await runtime.get_browser()
-            ok = await browser.set_checkbox(ref, checked)
-            _record(browser, ref, role, ok)
-            return _json({"ok": ok, "checked": checked, "role": role, "reason": reason})
+    async def attachment_state(ref: str) -> str:
+        """What a file input currently holds, without touching it.
 
-    @server.tool()
-    async def upload_file(ref: str, file_path: str, role: str, reason: str) -> str:
-        """Attach a local file to a file input (typically a resume)."""
+        Use before deciding an upload succeeded. A form frequently arrives with
+        a file already chosen -- LinkedIn keeps the last one selected, and ATS
+        forms re-populate a previously parsed resume -- and an attachment this
+        session did not put there is not evidence that it is the user's choice.
+        """
         async with runtime.lock:
             browser = await runtime.get_browser()
-            ok = await browser.upload_file(ref, file_path)
-            _record(browser, ref, role, ok)
-            return _json({"ok": ok, "path": file_path, "role": role, "reason": reason})
+            observed, readable = await browser.read_attachments(ref)
+            return _json(
+                {
+                    "readable": readable,
+                    "attachments": [{"name": f.name, "size": f.size} for f in observed],
+                    "hint": "" if readable else "could not read this input's file list",
+                }
+            )
 
     @server.tool()
     async def click_target(name: str = "", ref: str = "", role: str = "", reason: str = "") -> str:
@@ -322,9 +417,36 @@ def register(server: MCPServer, runtime: Runtime) -> None:
         `new_tab: true` -- "Apply on company site" leads to the employer's own
         ATS in a new tab, and continuing to drive the old tab would lose the
         application entirely.
+
+        **This cannot press the final submit.** Gating the button named
+        "Submit" is not enough: a `<button>` inside a form submits it whatever it
+        says, so the control is checked structurally as well as by name (`Save`,
+        `Continue`, any label at all can be the end of the form). Anything that looks like the end of the
+        application is refused here and must go through `submit_final`, which is
+        the only path that requires a verified grant. Walking a multi-step form
+        (Next, Review, Continue) is unaffected.
         """
         async with runtime.lock:
             browser = await runtime.get_browser()
+            facts, inspect_error = await browser.inspect_target(ref=ref, name=name)
+            if facts is None:
+                return _json({"clicked": False, "error": inspect_error})
+
+            decision = decide_click(facts, authorized=False)
+            if not decision.allowed:
+                return _json(
+                    {
+                        "clicked": False,
+                        "refused": True,
+                        "reason": decision.reason,
+                        **decision.to_dict(),
+                        "next_step": (
+                            "call prepare_submission / request_submission_grant, "
+                            "have the human approve it, then submit_final"
+                        ),
+                    }
+                )
+
             result = await browser.click(ref=ref, name=name)
             if role:
                 _record(browser, ref or name, role, result.clicked)
@@ -334,6 +456,7 @@ def register(server: MCPServer, runtime: Runtime) -> None:
                     "new_tab": result.new_tab,
                     "active_url": result.active_url,
                     "platform": platform_for_url(result.active_url),
+                    "target_class": decision.target_class.value,
                     "error": result.error,
                     "reason": reason,
                 }
@@ -616,16 +739,19 @@ def register(server: MCPServer, runtime: Runtime) -> None:
 
     @server.tool()
     async def request_submit_confirmation(summary: str, job_url: str, job_id: str = "") -> str:
-        """Request approval before submitting, and get a one-time token.
+        """Legacy confirmation row. Retained for compatibility; authorizes nothing.
 
-        `summary` must list the fields and the exact values that will be sent,
-        and call out anything the tool filled by itself. If the user has not
-        seen a value, they are approving something they cannot see.
+        The token this returns used to be the entire gate on submitting, but it
+        was checked *after* the click had already happened and it trusted a
+        boolean the caller supplied itself. Since M1:
 
-        Show the returned `summary_to_show` to the user and get an explicit yes.
-        Then call `submit_application` with `confirmation_id` and
-        `acknowledged: true`. The token is single-use and expires, so a stale
-        approval cannot be replayed onto a different job.
+        - the final submit can only be performed by `submit_final`, which needs a
+          grant a human minted separately;
+        - `click_target` refuses any control that ends the application.
+
+        So this is now a record of intent that nothing enforces. Prefer
+        `request_submission_grant`, whose summary is generated from values read
+        back off the live form rather than written by whoever is asking.
         """
         confirmation = runtime.guardrails.request_submit_confirmation(
             summary, job_url, job_id
@@ -637,17 +763,17 @@ def register(server: MCPServer, runtime: Runtime) -> None:
                 "job_url": confirmation.job_url,
                 "summary_to_show": confirmation.summary,
                 "expires_in_seconds": 900,
+                "authorizes_submission": False,
                 "next_step": (
-                    "show summary_to_show to the user; if they agree, call "
-                    "submit_application with this confirmation_id and "
-                    "acknowledged=true"
+                    "this token no longer gates submission. Use "
+                    "request_submission_grant -> human approval -> submit_final."
                 ),
             }
         )
 
     @server.tool()
     async def submit_application(
-        confirmation_id: str,
+        grant_id: str,
         job_url: str,
         job_id: str = "",
         job_title: str = "",
@@ -658,38 +784,64 @@ def register(server: MCPServer, runtime: Runtime) -> None:
         answers_used: list[str] | None = None,
         steps: int = 0,
         vision_fallbacks: int = 0,
-        acknowledged: bool = False,
+        outcome: str = "unverified",
     ) -> str:
-        """Record a submitted application. Call this only after clicking Submit.
+        """Record that a submission was made. It does not perform one, and it
+        does not decide whether the submission succeeded.
 
-        Requires a `confirmation_id` from `request_submit_confirmation`. Without
-        a valid, unused token this refuses -- the check is what makes "confirm
-        before submitting" real rather than advisory.
+        This is bookkeeping for submissions driven outside this server (the mouse
+        was clicked by a person, or by an older runner). What it promises about
+        the outcome comes entirely from `outcome`, which defaults to `unverified`:
 
-        When the client could not prompt the user directly, pass
-        `acknowledged: true` only after you have shown the user the summary and
-        they explicitly approved.
+        - `verified`   -- the page confirmed it;
+        - `unverified` -- sent, possibly received, never confirmed (**default**);
+        - `failed`     -- never sent, or rejected.
+
+        The previous version accepted `acknowledged=True` and wrote a success.
+        That flag was supplied by whoever called the tool, so "the user approved"
+        and "the caller claims the user approved" were the same input -- and the
+        only real gate, a summary shown to nobody in particular, was downstream
+        of the click anyway. `submit_final` replaces that: it *is* the final
+        action, and it only runs with a grant a human minted separately.
         """
-        # Check acknowledgement BEFORE spending the token. Consuming first and
-        # then rejecting would burn the approval, forcing the caller to ask the
-        # user all over again for a mistake that cost them nothing.
-        if not acknowledged:
-            pending = runtime.guardrails.peek_confirmation(confirmation_id)
+        if not grant_id:
             return _json(
                 {
                     "recorded": False,
                     "error": (
-                        "not acknowledged. Show the user the summary and call again "
-                        "with acknowledged=true only after they agree."
+                        "grant_id is required. To record something you did outside "
+                        "this server, first create a request with "
+                        "request_submission_grant and have a human approve it. "
+                        "Rails (daily cap, dedupe, pacing) are enforced by "
+                        "preflight regardless."
                     ),
-                    "summary_to_show": pending.summary if pending else "",
-                    "token_still_valid": pending is not None and not pending.used,
+                    "hint": (
+                        "A grant id proves a person authorized an exact snapshot of "
+                        "this application; a boolean does not."
+                    ),
                 }
             )
 
-        ok, message = runtime.guardrails.consume_confirmation(confirmation_id)
-        if not ok:
-            return _json({"recorded": False, "error": message})
+        grant = runtime.authorizer.peek(grant_id)
+        if grant is None:
+            return _json({"recorded": False, "error": "unknown grant id"})
+        if not grant.used:
+            return _json(
+                {
+                    "recorded": False,
+                    "error": (
+                        "that grant has not been spent by submit_final, so there is "
+                        "nothing corresponding to it to record."
+                    ),
+                }
+            )
+        if grant.job_key not in {job_id, extract_job_id(job_url), job_url}:
+            return _json(
+                {
+                    "recorded": False,
+                    "error": f"grant {grant_id[:8]}… was issued for a different job",
+                }
+            )
 
         record = runtime.memory.add_application(
             job_url=job_url,
@@ -702,10 +854,26 @@ def register(server: MCPServer, runtime: Runtime) -> None:
             answers_used=answers_used or [],
             steps=steps,
             vision_fallbacks=vision_fallbacks,
+            status="applied",
+            outcome=outcome,
+            grant_id=grant_id,
+            resume_sha256=grant.resume_sha256,
         )
-        runtime.guardrails.record_outcome(success=True)
-        return _json({"recorded": True, "application": record.model_dump(),
-                      "guard": runtime.guardrails.stats()})
+        # The rails are only advanced by outcomes we can defend: an unverified
+        # result must not be counted as a working submission.
+        if outcome == "verified":
+            runtime.guardrails.record_outcome(success=True)
+        elif outcome == "unverified":
+            runtime.guardrails.record_unverified(note="recorded externally, unconfirmed")
+        else:
+            runtime.guardrails.record_outcome(success=False, note="recorded as failed")
+        return _json(
+            {
+                "recorded": True,
+                "application": record.model_dump(),
+                "guard": runtime.guardrails.stats(),
+            }
+        )
 
     @server.tool()
     async def report_failure(
@@ -740,6 +908,228 @@ def register(server: MCPServer, runtime: Runtime) -> None:
         return _json(runtime.guardrails.stats())
 
     @server.tool()
+    async def form_snapshot() -> str:
+        """Every answerable field on the current page, with the value it holds.
+
+        Read from the DOM, not from what anything believes it typed. This is what
+        a submission grant binds to, so this is what gets approved: fields that
+        came back as `<unreadable>` are named rather than skipped, because
+        approving a form containing one should be a decision, not a gap.
+        """
+        async with runtime.lock:
+            browser = await runtime.get_browser()
+            snapshot = await browser.field_snapshot()
+            return _json(
+                {
+                    "url": browser.page.url,
+                    "platform": _evidence_platform(browser.page.url),
+                    "fields": snapshot,
+                    "unreadable": [k for k, v in snapshot.items() if v == "<unreadable>"],
+                }
+            )
+
+    @server.tool()
+    async def request_submission_grant(
+        job_url: str, job_id: str = "", route: str = "easy_apply"
+    ) -> str:
+        """Ask a human to authorize one specific submission. Authorizes nothing itself.
+
+        This creates a **pending request** carrying everything the decision
+        depends on: the field values as read back from the live form, the resume
+        digest, the profile and answer revisions, the route and an expiry. A
+        human then approves it out of band -- `applyops approve <request_id>` --
+        which is what mints the one-time grant `submit_final` needs.
+
+        The split is the boundary. If the process asking for permission could
+        also grant it, then "the user said yes" would be indistinguishable from
+        "the caller decided to say the user said yes", and the check would only
+        ever fail by accident.
+
+        Show `summary_to_show` to the user verbatim. Do not paraphrase it: these
+        are the values about to reach an employer.
+        """
+        async with runtime.lock:
+            browser = await runtime.get_browser()
+            try:
+                resume = _current_resume(runtime)
+            except ResumeError as exc:
+                return _json({"granted": False, "error": f"resume problem: {exc}"})
+
+            snapshot = await browser.field_snapshot()
+            platform = _evidence_platform(browser.page.url)
+            request = runtime.authorizer.create_request(
+                job_key=job_id or extract_job_id(job_url) or job_url,
+                job_url=job_url,
+                route=route,
+                platform=platform,
+                fields=snapshot,
+                resume_filename=resume.filename,
+                resume_sha256=resume.sha256,
+                answers_revision=_answers_revision(runtime),
+                profile_revision=_profile_revision(runtime),
+                source="mcp_relayed_to_human",
+            )
+            return _json(
+                {
+                    "granted": False,
+                    "status": "pending",
+                    "request_id": request.request_id,
+                    "summary_to_show": request.summary_for_human(),
+                    "next_step": (
+                        "show summary_to_show to the user. A human approves with "
+                        f"`applyops approve {request.request_id}`, which mints the "
+                        "grant; then call submit_final with the returned grant id."
+                    ),
+                }
+            )
+
+    @server.tool()
+    async def pending_submission_requests() -> str:
+        """Requests waiting for a human decision, oldest first."""
+        pending = runtime.authorizer.pending_requests()
+        return _json(
+            {
+                "count": len(pending),
+                "requests": [
+                    {
+                        "request_id": r.request_id,
+                        "job_key": r.job_key,
+                        "job_url": r.job_url,
+                        "route": r.route,
+                        "created_at": r.created_at,
+                        "summary": r.summary_for_human(),
+                    }
+                    for r in pending
+                ],
+            }
+        )
+
+    @server.tool()
+    async def submit_final(
+        grant_id: str,
+        job_url: str,
+        job_id: str = "",
+        route: str = "easy_apply",
+        final_ref: str = "",
+        final_name: str = "",
+        evidence_text: str = "",
+    ) -> str:
+        """Perform the real final submit -- the only way one can happen.
+
+        Requires a grant minted by a human approving a request. Nothing here
+        takes a boolean promise: `submit_application`'s `acknowledged=True` was a
+        sentence a model could write without asking anybody, and this replaces it
+        with an authorization that was produced by someone else.
+
+        Order enforced inside:
+
+        1. the target is inspected and must really be the final submit;
+        2. the form is snapshotted and compared against what was approved -- a
+           changed form, a different resume or an updated profile voids the grant;
+        3. the grant is spent inside its lock, so nothing else can spend it too;
+        4. only then is anything clicked.
+
+        Result is one of `verified`, `unverified` or `failed`. **Nothing retries.**
+        An `unverified` submission may already be sitting in an employer's inbox;
+        clicking again is how one application becomes two, so use
+        `reconcile_submission` to find out what happened instead.
+        """
+        async with runtime.lock:
+            browser = await runtime.get_browser()
+            try:
+                resume = _current_resume(runtime)
+            except ResumeError as exc:
+                return _json({"submitted": False, "error": f"resume problem: {exc}"})
+
+            action, detect_detail = await _detect_final_action(
+                browser, ref=final_ref, name=final_name
+            )
+            if action is None:
+                return _json({"submitted": False, "error": detect_detail})
+
+            patterns: tuple[str, ...]
+            if evidence_text:
+                patterns = (evidence_text,)
+            else:
+                patterns = SUCCESS_EVIDENCE.get(_evidence_platform(browser.page.url), ())
+
+            try:
+                outcome = await execute_authorized_submission(
+                    controller=browser,
+                    authorizer=runtime.authorizer,
+                    grant_id=grant_id,
+                    job_key=job_id or extract_job_id(job_url) or job_url,
+                    resume=resume,
+                    route=route,
+                    action=action,
+                    answers_revision=_answers_revision(runtime),
+                    profile_revision=_profile_revision(runtime),
+                    route_supported=bool(patterns),
+                    evidence_timeout=12.0,
+                )
+            except SubmissionRefused as exc:
+                return _json(
+                    {
+                        "submitted": False,
+                        "refused": True,
+                        "reason": exc.reason,
+                        "manual_required": exc.manual_required,
+                    }
+                )
+
+            if outcome.failed:
+                runtime.guardrails.record_outcome(success=False, note=outcome.detail)
+                _record_application(runtime, job_url, job_id, resume, outcome, "failed")
+            elif outcome.verified:
+                runtime.guardrails.record_outcome(success=True)
+                _record_application(runtime, job_url, job_id, resume, outcome, "applied")
+            else:
+                # SENT BUT UNCONFIRMED: the slot is spent, because the employer
+                # may well have received it, and retrying is forbidden.
+                runtime.guardrails.record_unverified()
+                _record_application(runtime, job_url, job_id, resume, outcome, "applied")
+
+            return _json(
+                {
+                    "submitted": True,
+                    **outcome.to_dict(),
+                    "guard": runtime.guardrails.stats(),
+                    "hint": (
+                        ""
+                        if outcome.verified
+                        else (
+                            "do not submit again. Call reconcile_submission to re-read "
+                            "the page, or have the person check their inbox and the "
+                            "employer's site directly."
+                        )
+                    ),
+                }
+            )
+
+    @server.tool()
+    async def reconcile_submission(evidence_text: str = "", final_ref: str = "") -> str:
+        """Find out what happened to a possibly-submitted application.
+
+        Read-only. It clicks nothing, submits nothing and can only ever raise its
+        own confidence: reading an unchanged page leaves the result `unverified`
+        and says so, rather than quietly upgrading a guess into a success.
+        """
+        async with runtime.lock:
+            browser = await runtime.get_browser()
+            patterns = (evidence_text,) if evidence_text else SUCCESS_EVIDENCE.get(
+                _evidence_platform(browser.page.url), ()
+            )
+            outcome = await reconcile_submission_impl(
+                controller=browser,
+                action=FinalAction(
+                    ref=final_ref,
+                    success_patterns=patterns,
+                ),
+                evidence_timeout=8.0,
+            )
+            return _json(outcome.to_dict())
+
+    @server.tool()
     async def browser_close() -> str:
         """Close the automation browser and release the profile."""
         async with runtime.lock:
@@ -751,3 +1141,148 @@ def _example_profile_path():
     from ..profile import example_profile_path
 
     return example_profile_path()
+
+
+# ── M1 helpers ───────────────────────────────────────────────────────
+#
+# Kept below `register` so they read as implementation detail rather than as
+# surface: nothing here becomes a tool, and a tool must never be able to reach
+# around the authorization path these helpers feed.
+
+
+def _evidence_platform(url: str) -> str:
+    """Which success vocabulary applies to this page.
+
+    The demo ATS gets its own label so that local safety tests can be verified
+    without pretending the employer side said anything.
+    """
+    lowered = (url or "").lower()
+    if any(host in lowered for host in DEMO_HOSTS):
+        return "DemoATS"
+    return platform_for_url(url)
+
+
+def _current_resume(runtime: Runtime) -> ResumeRef:
+    """The one resume. Raises `ResumeError` rather than inventing a default."""
+    configured = runtime.memory.profile.value("resume_path")
+    return resolve_resume(configured)
+
+
+def _compare_resume(runtime: Runtime, attached: str) -> dict:
+    """Is the file about to be attached the resume actually configured?"""
+    try:
+        expected = _current_resume(runtime)
+    except ResumeError as exc:
+        return {"match": False, "mismatch": True, "detail": str(exc)}
+    try:
+        actual = resolve_resume(attached)
+    except ResumeError as exc:
+        return {
+            "match": False,
+            "mismatch": True,
+            "detail": f"attached file could not be verified: {exc}",
+        }
+    if actual.sha256 == expected.sha256:
+        return {"match": True, "mismatch": False, "detail": ""}
+    return {
+        "match": False,
+        "mismatch": True,
+        "detail": (
+            f"attached {actual.filename} is not the configured resume "
+            f"{expected.filename}; confirm which one this employer should get"
+        ),
+    }
+
+
+def _answers_revision(runtime: Runtime) -> str:
+    """A changing marker for stored answers, so edits void stale approvals."""
+    qa = runtime.memory.get_all_qa()
+    return f"{len(qa)}:{max((getattr(q, 'updated_at', '') or '' for q in qa), default='')}"
+
+
+def _profile_revision(runtime: Runtime) -> str:
+    """A marker for the profile file's own content."""
+    try:
+        text = runtime.memory.profile.path.read_text(encoding="utf-8")
+    except OSError:
+        return "unreadable"
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+async def _detect_final_action(
+    browser: BrowserController, *, ref: str = "", name: str = ""
+) -> tuple[FinalAction | None, str]:
+    """Find the control that genuinely ends this application.
+
+    Detection rather than trust: the caller does not get to nominate any button
+    it likes, because nominating "Submit" is how a partial form gets sent. When a
+    candidate is supplied it still has to classify as a final submit; otherwise
+    the page itself is scanned and an ambiguous result is reported, never guessed
+    between.
+    """
+    candidates: list[tuple[str, str]] = []  # (ref, name)
+
+    if ref or name:
+        facts, error = await browser.inspect_target(ref=ref, name=name)
+        if facts is None:
+            return None, error
+        if decide_click(facts, authorized=True).target_class is ClickClass.FINAL_SUBMIT:
+            candidates.append((ref, name))
+        else:
+            return None, (
+                f"{facts.label!r} is not a final submit control "
+                f"(classified {decide_click(facts, authorized=True).target_class.value})"
+            )
+    else:
+        state = await browser.get_page_state()
+        for button in state.buttons:
+            facts, _ = await browser.inspect_target(name=button.name)
+            if facts is None:
+                continue
+            if (
+                decide_click(facts, authorized=True).target_class
+                is ClickClass.FINAL_SUBMIT
+            ):
+                candidates.append((facts.ref, button.name))
+
+    if not candidates:
+        return None, (
+            "no final submit control found on this page. Either the form is not "
+            "at its last step, or this route's final action is unknown -- in "
+            "which case the application must be finished by hand."
+        )
+    if len(candidates) > 1:
+        return None, (
+            "more than one final submit control found "
+            f"({', '.join(n for _, n in candidates)}); refusing to guess which "
+            "one ends the application. Pass final_ref explicitly."
+        )
+
+    found_ref, found_name = candidates[0]
+    patterns = SUCCESS_EVIDENCE.get(_evidence_platform(browser.page.url), ())
+    return FinalAction(ref=found_ref, name=found_name, success_patterns=patterns), ""
+
+
+def _record_application(
+    runtime: Runtime,
+    job_url: str,
+    job_id: str,
+    resume: ResumeRef,
+    outcome,
+    status: str,
+) -> None:
+    """Write the attempt to history, tagging the outcome honestly."""
+    # `outcome` (verified/unverified/failed) is what statistics count. `status`
+    # is only the coarse row label; succeeded there no longer implies anything
+    # about whether the employer received anything.
+    runtime.memory.add_application(
+        job_url=job_url,
+        job_id=job_id,
+        platform=platform_for_url(job_url),
+        apply_route=outcome.evidence.get("route", ""),
+        status=status,
+        outcome=outcome.status,
+        grant_id=outcome.grant_id,
+        resume_sha256=resume.sha256,
+        notes=outcome.detail,
+    )
