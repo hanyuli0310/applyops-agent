@@ -450,22 +450,23 @@ def create_app(
             resume = resolve_resume(state.memory.profile.value("resume_path"))
         except ResumeError as exc:
             raise HTTPException(409, f"resume problem: {exc}") from exc
-        browser = await state.get_browser()
-        action, detail = await detect_final_action(browser)
-        if action is None:
-            raise HTTPException(409, detail)
-        try:
-            outcome = await state.service.submit(
-                application_id,
-                grant_id=body.grant_id,
-                controller=browser,
-                resume=resume,
-                action=action,
-            )
-        except SubmissionRefused as exc:
-            raise HTTPException(403, exc.reason) from exc
-        except InvalidTransition as exc:
-            raise HTTPException(409, str(exc)) from exc
+        async with state.page_lock:
+            browser = await state.get_browser()
+            action, detail = await detect_final_action(browser)
+            if action is None:
+                raise HTTPException(409, detail)
+            try:
+                outcome = await state.service.submit(
+                    application_id,
+                    grant_id=body.grant_id,
+                    controller=browser,
+                    resume=resume,
+                    action=action,
+                )
+            except SubmissionRefused as exc:
+                raise HTTPException(403, exc.reason) from exc
+            except InvalidTransition as exc:
+                raise HTTPException(409, str(exc)) from exc
         return outcome.to_dict()
 
     # ── scoped answers: answer once, reuse at the right breadth ───────
@@ -601,8 +602,9 @@ def create_app(
     @app.post("/api/runner/pass")
     async def runner_pass() -> dict:
         """Run one supervised pass now, and report item by item."""
-        browser = await state.get_browser()
-        report = await state.runner.run_pass(browser)
+        async with state.page_lock:
+            browser = await state.get_browser()
+            report = await state.runner.run_pass(browser)
         return report.to_dict()
 
     @app.post("/api/browser/release")
@@ -612,7 +614,10 @@ def create_app(
         Without this the UI would hold the profile for its whole lifetime and
         every agent or scheduled run in the meantime would be refused.
         """
-        await state.close_browser()
+        # Waiting for the page lock is the point: closing the browser out from
+        # under a prepare or a submission would abort it mid-flight.
+        async with state.page_lock:
+            await state.close_browser()
         return {"closed": True}
 
     @app.post("/api/applications/{application_id}/reconcile")
@@ -620,12 +625,13 @@ def create_app(
         row = state.service.get(application_id)
         if row is None:
             raise HTTPException(404, "unknown application")
-        browser = await state.get_browser()
-        outcome = await state.service.reconcile(
-            application_id,
-            controller=browser,
-            action=FinalAction(success_patterns=success_patterns_for(browser.page.url)),
-        )
+        async with state.page_lock:
+            browser = await state.get_browser()
+            outcome = await state.service.reconcile(
+                application_id,
+                controller=browser,
+                action=FinalAction(success_patterns=success_patterns_for(browser.page.url)),
+            )
         return outcome.to_dict()
 
     # ── demo ─────────────────────────────────────────────────────────

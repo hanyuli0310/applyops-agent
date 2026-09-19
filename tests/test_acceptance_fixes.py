@@ -276,6 +276,12 @@ def test_three_applications_each_submit_with_their_own_grant():
     _set_up(root)
     client, app = _client(root)
     with client:
+        # This test is about grants being bound to their application, not about
+        # the interval between submissions: three in a row would otherwise be
+        # spaced 45-180s apart by the rails (which is correct behaviour, and is
+        # asserted in tests/test_blocker_concurrency.py).
+        app.state.applyops.guardrails.min_gap = (0.0, 0.0)
+
         submitted: list[str] = []
         for _ in range(3):
             demo = client.post("/api/demo/start").json()

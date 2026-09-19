@@ -21,6 +21,7 @@ so a crashed process lands in an honest state instead of a hopeful one.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import shutil
 import time
@@ -55,6 +56,11 @@ CLAIM_TTL = 600.0
 class ServiceConfig:
     data_dir: Path
     owner: str = ""
+
+
+#: How long a submission may pause for the rails' interval. Bounded, because a
+#: caller waiting on a web request should be told "not yet" rather than held.
+MAX_INLINE_WAIT_SECONDS = 60.0
 
 
 class ApplicationService:
@@ -225,6 +231,25 @@ class ApplicationService:
             decision = self.guardrails.preflight(row.job_url, row.job_key)
             if not decision.allowed:
                 raise SubmissionRefused(decision.reason)
+            if decision.wait_seconds > 0:
+                # The randomised spacing between submissions. Honouring it only
+                # in the MCP preflight tool meant the console and the runner went
+                # out back to back, so two drivers submitting in parallel ignored
+                # the interval the rails asked for.
+                await asyncio.sleep(min(decision.wait_seconds, MAX_INLINE_WAIT_SECONDS))
+                # And then ask again, against the file: the wait is not a licence
+                # to proceed. Another driver may have spent the last of the daily
+                # cap, or tripped the breaker, while we were sleeping.
+                rechecked = self.guardrails.preflight(row.job_url, row.job_key)
+                if not rechecked.allowed:
+                    raise SubmissionRefused(
+                        f"after waiting for the required interval: {rechecked.reason}"
+                    )
+                if rechecked.wait_seconds > 1.0:
+                    raise SubmissionRefused(
+                        "the required interval has not elapsed (another driver is "
+                        f"between submissions); {rechecked.wait_seconds:.0f}s remain"
+                    )
 
         if not self.ledger.claim(application_id, self.owner):
             raise InvalidTransition(

@@ -18,7 +18,6 @@ The rule under test: no evidence, no ownership, or no bookkeeping means
 
 from __future__ import annotations
 
-import json
 import tempfile
 from pathlib import Path
 
