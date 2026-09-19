@@ -243,3 +243,67 @@ demo enqueue, prepare, read the approval summary, approve, submit, and sees
 3. The UI polls every 5 s rather than SSE; acceptable for one local user.
 4. Lint caught `FinalAction` missing from the reconcile route (would 500 on
    first use) — fixed and covered by the route now importing from the core.
+
+---
+
+## M4 — Supervised Automation
+
+**Status: COMPLETE. All tests pass. The runner still cannot approve anything by
+itself.**
+
+- Starting commit: `5ea60df` (M3)
+- Branch: `feat/applyops-v02` (local only; not pushed)
+
+### What was built
+
+| piece | file(s) | why |
+|---|---|---|
+| Scoped answers (GLOBAL / COMPANY / APPLICATION) | new `src/applyops/answers.py` | the flywheel answered everything globally; sponsorship and salary questions must not cross employers |
+| Resolution is most-specific-first, no fuzzy matching | `answers.resolve()` | similar question text is not the same semantics (`PLAN.md` §6.3) |
+| Withdrawal bumps a revision that is part of every grant digest | `answers` + `authorization` | withdrawing an answer must void pending approvals immediately |
+| Queue runner | new `src/applyops/runner.py` | supervised passes: recover -> reconcile -> prepare -> submit only pre-approved work |
+| `AutoPolicy` + `PolicyStore` | `runner.py`, `data/auto_policy.json` | limited auto mode is explicit opt-in with max applications, platform allowlist, expiry; **disabled by default** |
+| Pause / resume / stop | `runner` | checked between applications; never interrupts an in-flight submission |
+
+### What limited auto mode means here (and what it does not)
+
+A pass with the policy enabled may prepare applications and spend **already
+approved** grants, up to `max_applications`, only on `allowed_platforms`, only
+before `expires_at_epoch`. It still cannot mint a grant: every submission was
+individually approved by a human via CLI or UI. The default policy is disabled,
+and a pass with the default policy submits nothing.
+
+### Tests executed
+
+Run per-module (see note below):
+
+```bash
+.venv/bin/python -m pytest tests/test_core.py tests/test_concurrency.py -q   # 22 passed
+.venv/bin/python -m pytest tests/test_m1_trusted_execution.py -q             # 40 passed
+.venv/bin/python -m pytest tests/test_m2_unified_core.py -q                  # 23 passed
+.venv/bin/python -m pytest tests/test_m3_local_ui.py -q                      # 9 passed
+.venv/bin/python -m pytest tests/test_m4_supervised_automation.py -q         # 13 passed
+```
+
+107 total, 0 failures. M4 covers: scope precedence, application-scope isolation,
+no fuzzy inheritance, scope context required, withdrawal revision + voided
+grant, policy defaults/expiry, disabled policy prepares-but-never-submits,
+missing resume parks with reason, policy budget of 1 spends exactly 1 of 2
+pre-approved grants, platform allowlist refuses (and does not even prepare),
+pause/stop honoured, reconciliation pass never submits.
+
+**Environment note:** running the whole suite in one pytest process is killed by
+the sandbox (exit 137, memory pressure from many headless Chromes). Per-module
+runs are green and stable; a CI matrix should shard the browser tests.
+
+### Known limitations
+
+1. The runner fills nothing itself beyond what M1's flow already does; field
+   filling for real employers remains the harness's job (this is the "hands +
+   brain" split, unchanged).
+2. `pending_questions` batching across applications is served by the scoped
+   answer store; a dedicated "answer once, resume affected" sweep lands with the
+   UI's needs-attention page, which already shows waiting_for_input rows.
+3. `cron_apply.py` still runs the old flow. It keeps working through the same
+   guardrails, but moving it onto `QueueRunner` is deferred (its unattended
+   cadence is exactly what limited auto mode gates).
