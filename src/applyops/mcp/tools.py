@@ -42,13 +42,15 @@ from ..evidence import (
     success_patterns_for,
 )
 from ..memory import extract_job_id
-from ..platforms.naming import platform_for_url
+from ..platforms.naming import platform_for_url, resolve_route
+from ..prepare import PrepareRefused
+from ..prepare import prepare_application as prepare_application_impl
 from ..resume import (
     ResumeError,
     ResumeRef,
     resolve_resume,
 )
-from ..state_machine import InvalidTransition
+from ..state_machine import ApplicationState, InvalidTransition
 from ..submission import (
     FinalAction,
     SubmissionRefused,
@@ -883,6 +885,54 @@ def register(server: MCPServer, runtime: Runtime) -> None:
             )
 
     @server.tool()
+    async def prepare_application(application_id: str) -> str:
+        """Fill an application's form, verify it, and file the approval request.
+
+        This is the step between `enqueue_application` and
+        `request_submission_grant`, and it used to be missing from MCP
+        altogether: an agent could enqueue an application and then be refused at
+        submit time because nothing had moved it out of QUEUED.
+
+        It fills from the profile and the scoped answers, verifies every value it
+        writes, attaches the configured resume, and **only then** asks for
+        approval. Anything unresolved parks the application in
+        `waiting_for_input` and names the fields -- show that list to the user and
+        call `record_answer` for the missing questions, then call this again.
+
+        The route decides whether this may run at all: a route with no verified
+        submission path is parked rather than driven as something it is not.
+        """
+        async with runtime.lock:
+            browser = await runtime.get_browser()
+            try:
+                outcome = await prepare_application_impl(
+                    runtime.service, browser, application_id
+                )
+            except KeyError:
+                return _json({"error": f"unknown application {application_id}"})
+            except PrepareRefused as exc:
+                return _json(
+                    {
+                        "state": "refused",
+                        "application_id": application_id,
+                        "reason": str(exc),
+                    }
+                )
+            payload = outcome.to_dict()
+            payload["application_id"] = application_id
+            if outcome.state == ApplicationState.WAITING_FOR_INPUT.value:
+                payload["next_step"] = (
+                    "show `missing` to the user, record their answers with "
+                    "record_answer, then call prepare_application again"
+                )
+            elif outcome.ready:
+                payload["next_step"] = (
+                    "call request_submission_grant for this application, show its "
+                    "summary to the user, and let a human approve it"
+                )
+            return _json(payload)
+
+    @server.tool()
     async def request_submission_grant(
         job_url: str,
         job_id: str = "",
@@ -913,13 +963,30 @@ def register(server: MCPServer, runtime: Runtime) -> None:
                 return _json({"granted": False, "error": f"resume problem: {exc}"})
 
             snapshot = await browser.field_snapshot()
-            platform = evidence_platform(browser.page.url)
+            row = (
+                runtime.service.get(application_id)
+                if application_id
+                else runtime.service.ledger.find_by_job_key(
+                    job_id or extract_job_id(job_url) or job_url
+                )
+            )
+            if row is None:
+                return _json(
+                    {
+                        "granted": False,
+                        "error": (
+                            "no application on record; call enqueue_application "
+                            "then prepare_application before asking for approval"
+                        ),
+                    }
+                )
+
             profile_revision, answers_revision = runtime.service.revisions()
             request = runtime.authorizer.create_request(
-                job_key=job_id or extract_job_id(job_url) or job_url,
-                job_url=job_url,
-                route=route,
-                platform=platform,
+                job_key=row.job_key,
+                job_url=row.job_url,
+                route=row.route or resolve_route(row.job_url, row.platform),
+                platform=row.platform,
                 fields=snapshot,
                 resume_filename=resume.filename,
                 resume_sha256=resume.sha256,
@@ -1116,7 +1183,9 @@ def register(server: MCPServer, runtime: Runtime) -> None:
         row = runtime.service.enqueue(
             job_url=job_url,
             job_id=job_id or extract_job_id(job_url),
-            route=route,
+            # `resolve_route` is the only place a route is decided; callers may
+            # override it, but a missing route never becomes "demo" by accident.
+            route=route or resolve_route(job_url, platform),
             platform=platform or platform_for_url(job_url),
             title=title,
             company=company,

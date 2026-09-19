@@ -38,12 +38,14 @@ from ..browser import BrowserController
 from ..concurrency import FileLock, browser_lock_path, describe_holder
 from ..demo_ats import DemoATS
 from ..evidence import detect_final_action, success_patterns_for
-from ..filling import fill_application_form, resume_for_fill
 from ..guardrails import Guardrails
 from ..ledger import Ledger
 from ..memory import MemoryStore
+from ..platforms.naming import DEMO_ROUTE, resolve_route
 from ..preferences import JobPreferences, PreferenceStore
 from ..preferences import evaluate as evaluate_job
+from ..prepare import PrepareRefused
+from ..prepare import prepare_application as prepare_application_impl
 from ..resume import ResumeError, resolve_resume
 from ..runner import AutoPolicy, QueueRunner
 from ..service import ApplicationService
@@ -132,7 +134,10 @@ class AppState:
             self.service, memory=self.memory, answers=self.answers
         )
         self._browser: BrowserController | None = None
-        self._browser_lock = asyncio.Lock()
+        # One page, one writer *within* this process: prepare, submit, runner
+        # passes and browser release all take this before touching the page.
+        # The profile lock below is the cross-process half of the same rule.
+        self.page_lock = asyncio.Lock()
 
         # The UI is a browser owner like any other, so it takes the same
         # cross-process profile lock the MCP server and the runner take. Two
@@ -347,7 +352,8 @@ def create_app(
             job_id=body.job_id.strip(),
             title=body.title,
             company=body.company,
-            route="demo" if "127.0.0.1" in body.job_url or "localhost" in body.job_url else "",
+            # One route vocabulary, resolved in one place (see platforms.naming).
+            route=resolve_route(body.job_url.strip()),
         )
         return {"enqueued": True, "application": row.to_dict()}
 
@@ -370,101 +376,29 @@ def create_app(
 
     @app.post("/api/applications/{application_id}/prepare")
     async def prepare(application_id: str) -> dict:
-        """Open the posting, actually fill the form, then file the approval request.
+        """Open the posting, fill it, and file the approval request.
 
-        The order matters and is the whole point of this route:
-
-        1. open the application's own URL (identity is checked at submit time,
-           not assumed here);
-        2. fill every field we can justify -- profile, then scoped answers --
-           verifying each write against the page;
-        3. attach the configured resume and verify the input holds it;
-        4. only if nothing is missing, unreadable or wrong, file the approval
-           request with the values that are *actually on the form*.
-
-        Anything unresolved parks the application in `WAITING_FOR_INPUT` with the
-        list of missing fields, and no request is created. Approving an empty
-        form is not a thing this system will offer.
+        The work lives in `applyops.prepare` so that MCP, the console and the
+        runner cannot drift: this route only supplies the browser and translates
+        the outcome.
         """
-        row = state.service.get(application_id)
-        if row is None:
+        if state.service.get(application_id) is None:
             raise HTTPException(404, "unknown application")
-        if row.state == ApplicationState.SUBMITTED_UNVERIFIED.value:
-            raise HTTPException(409, "this application was possibly submitted; reconcile instead")
 
-        # The demo job points at the local ATS; starting it here is what makes
-        # the one-click demo real rather than a URL that 404s.
-        if state.demo_ats is not None or "127.0.0.1" in row.job_url or "localhost" in row.job_url:
+        row = state.service.get(application_id)
+        if "127.0.0.1" in row.job_url or "localhost" in row.job_url:
             state.start_demo_ats()
 
-        browser = await state.get_browser()
-        await browser.goto(row.job_url, settle=1.0)
-
-        report = await fill_application_form(
-            browser,
-            memory=state.memory,
-            answers=state.answers,
-            resume=resume_for_fill(state.memory),
-            application_id=application_id,
-            company=row.company,
-        )
-
-        if not report.ready:
-            missing = (
-                report.unfilled_required
-                or report.unreadable
-                or [m.label for m in report.mismatched]
-                or report.problems
-            )
-            state.service.prepare(
-                application_id,
-                ready=False,
-                detail=f"needs input before it can be submitted: {', '.join(missing)}",
-                payload={"fill_report": report.to_dict()},
-            )
-            return {
-                "state": ApplicationState.WAITING_FOR_INPUT.value,
-                "missing": missing,
-                "fill_report": report.to_dict(),
-            }
-
-        snapshot = await browser.field_snapshot()
-        try:
-            resume = resolve_resume(state.memory.profile.value("resume_path"))
-        except ResumeError as exc:
-            state.service.prepare(application_id, ready=False, detail=str(exc))
-            return {
-                "state": ApplicationState.WAITING_FOR_INPUT.value,
-                "missing": ["resume"],
-                "detail": str(exc),
-            }
-
-        profile_revision, answers_revision = state.service.revisions()
-        request = state.authorizer.create_request(
-            job_key=row.job_key,
-            job_url=row.job_url,
-            route=row.route or "demo",
-            platform=row.platform or "DemoATS",
-            fields=snapshot,
-            resume_filename=resume.filename,
-            resume_sha256=resume.sha256,
-            answers_revision=answers_revision,
-            profile_revision=profile_revision,
-            application_id=application_id,
-            page_url=browser.page.url,
-            requested_by="local_ui",
-        )
-        state.service.prepare(
-            application_id,
-            ready=True,
-            detail=f"request {request.request_id} filed for approval",
-        )
-        return {
-            "state": ApplicationState.WAITING_FOR_APPROVAL.value,
-            "request_id": request.request_id,
-            "filled": len(report.filled),
-            "fill_report": report.to_dict(),
-        }
+        # One page, one writer: the browser lock serialises every driver.
+        async with state.page_lock:
+            browser = await state.get_browser()
+            try:
+                outcome = await prepare_application_impl(
+                    state.service, browser, application_id
+                )
+            except PrepareRefused as exc:
+                raise HTTPException(409, str(exc)) from exc
+        return outcome.to_dict()
 
     @app.get("/api/requests")
     async def pending_requests() -> dict:
@@ -707,7 +641,7 @@ def create_app(
         row = state.service.enqueue(
             job_url=f"{demo_url}/form?demo={state.demo_counter}",
             job_id=f"demo-{demo_url.rsplit(':', 1)[-1]}-{state.demo_counter}",
-            route="demo",
+            route=DEMO_ROUTE,
             platform="DemoATS",
             title="Backend Engineer (demo)",
             company="ApplyOps Demo Co",
