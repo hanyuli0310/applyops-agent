@@ -183,3 +183,63 @@ only verified.
 
 **M3 — Local Web UI**: FastAPI service backend over `ApplicationService`,
 React/TypeScript/Vite frontend, four pages, real API only (no mock data).
+
+---
+
+## M3 — Local Web UI
+
+**Status: COMPLETE. All tests pass, including a real-browser walk of all four
+pages against the built frontend. No mock data anywhere.**
+
+- Starting commit: `0663b10` (M2)
+- Branch: `feat/applyops-v02` (local only; not pushed)
+
+### What was built
+
+| piece | file(s) |
+|---|---|
+| FastAPI backend over the unified core (no duplicated semantics) | `src/applyops/api/app.py` |
+| React + TypeScript + Vite frontend, four pages | `frontend/` (`Profile` `Jobs` `Attention` `Applications`) |
+| Frontend production build served by the backend | `frontend/dist`, mounted at `/` |
+
+Pages map 1:1 to `PLAN.md` §3.2: 资料与简历 (profile editor, single-resume upload
+with sha256 shown), 岗位与偏好 (paste URL / one-click local demo job, queue
+preview with states), 待我处理 (approval requests with the full value summary,
+read-only reconcile for unknown results), 运行与记录 (all states, attempts,
+event history, JSON export).
+
+### The boundary in UI form
+
+`POST /api/requests/{id}/approve` is the only place a grant is born, and the API
+process binds loopback only (`serve()` refuses any other host). The requesting
+side -- the prepare route -- can only file a request. This is the M3 answer to
+`PLAN.md` §5.3's "approval entry is a local user UI".
+
+### Tests executed
+
+```bash
+.venv/bin/python -m pytest tests/ -q        # 94 passed in 111.7s (85 + 9 M3)
+npm run build                               # tsc + vite, clean
+```
+
+API tests: honest status, profile round-trip, unknown-field rejection (422),
+resume upload becomes the one configured resume (content-addressed), unsupported
+type 415, demo flow through approval (second approve 409), submit with a
+fabricated grant 403, loopback-only serve.
+
+Browser E2E (`test_four_pages_end_to_end_in_a_real_browser`): drives the built
+frontend with Playwright — profile page renders the seeded resume, one-click
+demo enqueue, prepare, read the approval summary, approve, submit, and sees
+「已确认提交成功」. The same flow was verified at the API level to end
+`SUBMITTED_VERIFIED` with `matched_text: "Application received"`.
+
+### Known limitations
+
+1. Approval is any local program; no login/session on the loopback API yet (M5
+   adds Host/Origin hardening; the process is not reachable off-machine).
+2. Jobs & Preferences page covers enqueue + queue states; preference rules
+   (titles/locations/exclusions) arrive with the supervised runner in M4, where
+   the matcher exists.
+3. The UI polls every 5 s rather than SSE; acceptable for one local user.
+4. Lint caught `FinalAction` missing from the reconcile route (would 500 on
+   first use) — fixed and covered by the route now importing from the core.

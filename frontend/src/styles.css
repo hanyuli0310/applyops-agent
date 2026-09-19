@@ -1,0 +1,60 @@
+:root {
+  color-scheme: light;
+  font-family: -apple-system, system-ui, "PingFang SC", sans-serif;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --line: #d8dee4;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: #f6f8fa; color: #1f2328; }
+.app { max-width: 56rem; margin: 0 auto; padding: 1rem 1.25rem 4rem; }
+header h1 { font-size: 1.3rem; margin: 0.6rem 0; }
+.statusline { display: flex; gap: 1rem; font-size: 0.85rem; color: #57606a; margin-bottom: 0.5rem; }
+.statusline .ok { color: var(--ok); font-weight: 600; }
+.statusline .warn { color: var(--warn); font-weight: 600; }
+nav { display: flex; gap: 0.5rem; border-bottom: 1px solid var(--line); margin-bottom: 1rem; }
+nav button {
+  border: none; background: none; padding: 0.6rem 0.9rem; font-size: 0.95rem;
+  color: #57606a; cursor: pointer; border-bottom: 2px solid transparent;
+}
+nav button.active { color: #1f2328; font-weight: 600; border-bottom-color: #0969da; }
+.badge {
+  background: #0969da; color: white; border-radius: 999px; font-size: 0.7rem;
+  padding: 0.05rem 0.45rem; margin-left: 0.35rem;
+}
+.card {
+  background: white; border: 1px solid var(--line); border-radius: 8px;
+  padding: 1rem 1.1rem; margin-bottom: 1rem;
+}
+.card h3 { margin-top: 0; }
+.row { display: flex; align-items: center; gap: 0.6rem; padding: 0.45rem 0; border-bottom: 1px solid #f0f3f6; flex-wrap: wrap; }
+.row:last-child { border-bottom: none; }
+.pill {
+  border-radius: 999px; padding: 0.1rem 0.6rem; font-size: 0.78rem;
+  background: #eaeef2; color: #57606a; white-space: nowrap;
+}
+.pill.ok { background: #dafbe1; color: var(--ok); }
+.pill.warn { background: #fff8c5; color: var(--warn); }
+.dim { color: #57606a; font-size: 0.85rem; }
+label { display: block; margin: 0.55rem 0; font-size: 0.9rem; }
+input, select {
+  width: 100%; padding: 0.45rem 0.6rem; margin-top: 0.2rem;
+  border: 1px solid var(--line); border-radius: 6px; font-size: 0.9rem;
+}
+.actions { display: flex; gap: 0.5rem; margin-top: 0.7rem; flex-wrap: wrap; }
+button {
+  padding: 0.4rem 0.9rem; border: 1px solid var(--line); border-radius: 6px;
+  background: #f6f8fa; cursor: pointer; font-size: 0.88rem;
+}
+button.primary { background: #0969da; border-color: #0969da; color: white; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.banner { border-radius: 6px; padding: 0.6rem 0.9rem; margin: 0.7rem 0; font-size: 0.9rem; }
+.banner.ok { background: #dafbe1; border: 1px solid #aceebb; }
+.banner.error { background: #ffebe9; border: 1px solid #ffcecb; }
+.hint { color: #57606a; font-size: 0.85rem; }
+.warn { color: var(--warn); }
+pre.summary {
+  background: #f6f8fa; border: 1px solid var(--line); border-radius: 6px;
+  padding: 0.7rem; font-size: 0.8rem; white-space: pre-wrap; overflow-x: auto;
+}
+footer { position: fixed; bottom: 0; left: 0; right: 0; background: #f6f8faee; border-top: 1px solid var(--line); padding: 0.4rem 1.25rem; font-size: 0.8rem; color: #57606a; }
