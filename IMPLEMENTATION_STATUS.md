@@ -493,3 +493,89 @@ completion in its own process, and the two batches cover the file's 7 tests.
    unusual labels parks for a human (intended) but needs per-route knowledge to
    be pleasant.
 5. The console still polls every 5 seconds (no SSE).
+
+---
+
+## Final blocker fixes (round 3)
+
+Baseline `8c2ee5b`. Two blockers, tests written first, minimal fixes, one local
+commit. `AGENTS.md`'s uncommitted change was left untouched.
+
+### Fix 1 — the MCP answer path now writes what the filler reads
+
+`record_answer` wrote only to the legacy learning flywheel (`runtime.memory`)
+while `fill_application_form` resolves from the unified `AnswerStore`. The public
+tool therefore reported `stored: true` for an answer the filler could not see,
+and `prepare_application` reported the same question as missing forever.
+
+- `record_answer(question, answer, context, scope, company, application_id)` now
+  writes to `service.answers` — the store the filler reads — and *also* copies to
+  the flywheel for learning/statistics. A flywheel failure cannot turn a
+  successful store write into a report of failure, and a store failure is never
+  reported as success.
+- Scope defaults to the narrowest thing the caller named: `application_id` ->
+  `application`, `company` -> `company`, otherwise `global`. An application-scoped
+  answer without an id, or a company-scoped one without a company, is refused with
+  an explanation instead of being silently downgraded.
+- `get_answer` reads the unified store first and reports `source: answers:<scope>`,
+  so "saved" and "the filler will use it" cannot disagree.
+- `prepare_application`'s `next_step` now names the tool, the scope and the
+  application id to pass.
+- **Also fixed, found by the new E2E:** `submit_final(route=...)` defaulted to
+  `easy_apply`, which overrode the ledger row's own route (`demo`) and made the
+  approval digest mismatch — every non-LinkedIn MCP submission failed with "the
+  form no longer matches what was approved". The default is now the recorded
+  route.
+
+### Fix 2 — an exception after the final click is UNVERIFIED, not FAILED
+
+`_click_final` ran resolve, click, wait and tab adoption in one `try`, then
+decided whether the click had happened by searching the exception message for
+"Timeout" or "navigat". Every other post-click failure — a closed page, a tab
+that could not be adopted, a browser that went away — came back as
+`clicked=False, sent=False`, which lands as FAILED: the one state a retry may
+start from.
+
+- Three explicit phases, decided by control flow: `pre_click` (control never
+  found — nothing sent), `click_attempted` (`click()` raised; it may still have
+  dispatched), `post_click` (the click returned; observing the result failed).
+- From `click_attempted` onward the result is always "the click was attempted"
+  and the outcome is UNVERIFIED with `sent_possible`, `reconciliation_required`
+  and no automatic retry. Only `pre_click` can produce FAILED / `sent: false`.
+
+### New tests
+
+| file | tests | covers |
+|---|---|---|
+| `tests/test_blocker_mcp_answers.py` | 4 | the reported MCP answer loop end to end through public tools only (enqueue → prepare → answer → prepare → approve → submit → status → ATS received the fields and the resume); `get_answer` reports what the filler reads; application-scoped answers do not leak; global answers are visible everywhere and a company-scoped one without a company is refused |
+| `tests/test_blocker_click_phases.py` | 6 | pre-click failure → no click and FAILED/unsent; a raising `click()` still counts as attempted; post-click failure is unknown; a page that dies after the click lands SUBMITTED_UNVERIFIED and cannot be resubmitted (ATS POST count stays 1); the verified happy path still works |
+
+### Test results
+
+| suite | result | exit |
+|---|---|---|
+| `tests/test_blocker_mcp_answers.py` | 4 passed | 0 |
+| `tests/test_blocker_click_phases.py` | 6 passed | 0 |
+| `tests/test_blocker_mcp_flow.py` | 3 passed | 0 |
+| `tests/test_blocker_choice_groups.py` | 3 passed | 0 |
+| `tests/test_blocker_reconcile_binding.py` | 6 passed | 0 |
+| `tests/test_blocker_concurrency.py` | 7 passed (batches: 5 + 1 + 1) | 0 |
+| `tests/test_m1_trusted_execution.py` | 40 passed | 0 |
+| `tests/test_m2_unified_core.py` | 23 passed | 0 |
+| `tests/test_m3_local_ui.py` | 9 passed | 0 |
+| `tests/test_m4_supervised_automation.py` | 13 passed | 0 |
+| `tests/test_m5_productization.py` | 9 passed | 0 |
+| `tests/test_core.py` + `tests/test_concurrency.py` | 22 passed | 0 |
+| `tests/test_acceptance_fixes.py` | 25 passed | 0 |
+| frontend `npx vitest run` / `npm run build` / `tsc --noEmit` | 7 passed / clean / clean | 0 |
+| `ruff check src tools tests` | 134 findings, all pre-existing debt (same as baseline) | 1 |
+
+Not run as one process: `tests/test_blocker_concurrency.py` (three batches) and
+the whole suite at once — the sandbox's memory cap kills both (exit 137) once
+enough headless Chromes accumulate.
+
+### Blockers that would stop basic local / MCP demo use
+
+None known. The MCP demo flow now runs end to end through public tools only
+(enqueue → prepare → answer → prepare → approve → submit → status), and the two
+stores that used to disagree are one.

@@ -467,6 +467,26 @@ def register(server: MCPServer, runtime: Runtime) -> None:
           - "need_human"  -- nothing usable stored; ask the user, then call
                              `record_answer` so the next run does not have to
         """
+        # The unified store first: it is what `prepare_application` reads, so an
+        # agent that checks here is checking the thing that will actually be used.
+        scoped = runtime.service.answers.resolve(question)
+        if scoped is not None:
+            return _json(
+                {
+                    "status": "answered",
+                    "answer": scoped.answer,
+                    "source": f"answers:{scoped.scope}",
+                    "scope": scoped.scope,
+                    "answer_id": scoped.id,
+                    "confidence": 1.0,
+                    "use_answer_verbatim": True,
+                    "note": (
+                        "this is the value prepare_application will fill in for this "
+                        "question"
+                    ),
+                }
+            )
+
         found = runtime.memory.get_confident_answer(question)
         if found is not None:
             found.mark_used()
@@ -502,22 +522,91 @@ def register(server: MCPServer, runtime: Runtime) -> None:
         return _json({"status": "need_human", "question": question})
 
     @server.tool()
-    async def record_answer(question: str, answer: str, context: str = "") -> str:
-        """Store a user-supplied answer so future applications reuse it.
+    async def record_answer(
+        question: str,
+        answer: str,
+        context: str = "",
+        scope: str = "",
+        company: str = "",
+        application_id: str = "",
+    ) -> str:
+        """Store a user-supplied answer so the next prepare can use it.
 
         Call this immediately after the user answers something, including the
         exact wording of the question as the form asked it.
+
+        **This is the write the filler reads.** Answers go into the unified
+        answer store (`scope` = global / company / application), which is what
+        `prepare_application` resolves against. It used to write only to the
+        learning flywheel, so an agent could record an answer, be told `stored:
+        true`, and then watch the same question come back as missing forever.
+
+        `scope` defaults to the narrowest thing the caller can name:
+
+        - `application_id` given -> `application` (recommended here: an answer
+          about one posting must not follow the user to another employer);
+        - `company` given -> `company`;
+        - otherwise -> `global`.
+
+        Verification: call `get_answer` with the same question afterwards. It
+        reads the same store, so "saved" and "the filler can use it" cannot
+        disagree.
         """
-        entry = runtime.memory.learn(question, answer, context=context, source="user")
-        return _json(
-            {
-                "stored": True,
-                "question_id": entry.id,
-                "normalized_key": entry.key,
-                "confidence": entry.confidence,
-                "total_learned": len(runtime.memory.get_all_qa()),
-            }
+        resolved_scope = (scope or "").strip() or (
+            "application" if application_id.strip() else ("company" if company.strip() else "global")
         )
+        try:
+            entry = runtime.service.answers.set_answer(
+                question,
+                answer,
+                scope=resolved_scope,
+                company=company,
+                application_id=application_id,
+            )
+        except ValueError as exc:
+            return _json(
+                {
+                    "stored": False,
+                    "error": str(exc),
+                    "attempted_scope": resolved_scope,
+                    "next_step": (
+                        "an application-scoped answer needs `application_id`, and a "
+                        "company-scoped answer needs `company`. Pass one, or omit "
+                        "`scope` to store it globally."
+                    ),
+                }
+            )
+
+        # The learning flywheel still gets a copy -- statistics and suggestions
+        # are what it is for -- but it is never the source of truth for filling a
+        # form, and a failure there must not turn a successful store write into a
+        # report of failure.
+        flywheel = "learned"
+        try:
+            runtime.memory.learn(question, answer, context=context, source="user")
+        except Exception as exc:  # noqa: BLE001 - secondary store
+            flywheel = f"failed: {type(exc).__name__}"
+
+        payload = {
+            "stored": True,
+            "question": entry.question,
+            "scope": entry.scope,
+            "application_id": entry.application_id,
+            "company": entry.company,
+            "answers_revision": runtime.service.answers.revision,
+            "flywheel": flywheel,
+        }
+        if entry.scope == "application":
+            payload["next_step"] = (
+                "call prepare_application for this application again; the answer is "
+                "stored for it alone and will not follow the user to other postings"
+            )
+        else:
+            payload["next_step"] = (
+                "this answer applies at "
+                f"{entry.scope} scope; call prepare_application again to use it"
+            )
+        return _json(payload)
 
     @server.tool()
     async def get_selector_hints(platform: str) -> str:
@@ -919,8 +1008,13 @@ def register(server: MCPServer, runtime: Runtime) -> None:
             payload["application_id"] = application_id
             if outcome.state == ApplicationState.WAITING_FOR_INPUT.value:
                 payload["next_step"] = (
-                    "show `missing` to the user, record their answers with "
-                    "record_answer, then call prepare_application again"
+                    "show `missing` to the user, then for each question call "
+                    "record_answer(question=<the question text from `missing`>, "
+                    "answer=<the user's answer>, scope='application', "
+                    f"application_id='{application_id}') -- application scope keeps "
+                    "one posting's answers out of another's -- and call "
+                    "prepare_application again. get_answer checks the value the "
+                    "filler will use."
                 )
             elif outcome.ready:
                 payload["next_step"] = (
@@ -1033,13 +1127,19 @@ def register(server: MCPServer, runtime: Runtime) -> None:
         grant_id: str,
         job_url: str,
         job_id: str = "",
-        route: str = "easy_apply",
+        route: str = "",
         application_id: str = "",
         final_ref: str = "",
         final_name: str = "",
         evidence_text: str = "",
     ) -> str:
         """Perform the real final submit -- the only way one can happen.
+
+        `route` defaults to the route recorded on the application, not to a
+        hard-coded one: the approval's digest covers the route, so passing a
+        different one (the default used to be `easy_apply` regardless of the job)
+        made every non-LinkedIn submission fail with "the form no longer matches
+        what was approved".
 
         Requires a grant minted by a human approving a request. Nothing here
         takes a boolean promise: `submit_application`'s `acknowledged=True` was a

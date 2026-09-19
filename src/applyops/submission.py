@@ -208,12 +208,14 @@ async def execute_authorized_submission(
 
     result = await _click_final(controller, action)
     if not result.get("clicked"):
+        # Only phase one lands here, and only it may: the control was never
+        # pressed, so nothing was sent and a retry is safe.
         return SubmitOutcome(
             status=STATUS_FAILED,
             job_key=job_key,
             grant_id=grant_id,
             detail=f"the final click did not happen: {result.get('error', 'unknown')}",
-            evidence={"click": result, "sent": False},
+            evidence={"click": result, "sent": False, "phase": result.get("phase", "")},
         )
 
     if not result.get("settled", True):
@@ -225,13 +227,14 @@ async def execute_authorized_submission(
             job_key=job_key,
             grant_id=grant_id,
             detail=(
-                "the submission was pressed but the page never settled, so it is "
-                "unknown whether the employer received it. Do not submit again; "
-                "reconcile instead."
+                "the submission was pressed but the result could not be observed "
+                f"({result.get('phase', 'post_click')}), so it is unknown whether the "
+                "employer received it. Do not submit again; reconcile instead."
             ),
             evidence={
                 "click": result,
                 "sent": True,
+                "sent_possible": True,
                 "reconciliation_required": True,
                 "resume": resume.to_dict(),
             },
@@ -299,38 +302,92 @@ async def execute_authorized_submission(
     )
 
 
+async def _resolve_final_control(
+    controller: BrowserController, action: FinalAction
+) -> tuple[object | None, str]:
+    """The control to press, or (None, why not). Phase one of the click."""
+    from . import locator as locator_module
+
+    if action.ref:
+        element = await locator_module.resolve_ref(controller.page, action.ref)
+        if element is None:
+            return None, f"unresolvable ref {action.ref!r}"
+        return element, ""
+    element = await locator_module.find_button(controller.page, action.name)
+    if element is None:
+        return None, f"no button named {action.name!r}"
+    return element, ""
+
+
 async def _click_final(controller: BrowserController, action: FinalAction) -> dict:
-    """Press the final control. Returns the raw click result as a dict."""
+    """Press the final control, in three explicit phases.
+
+    The phases exist so that "did the click happen?" is answered by control flow
+    rather than by reading an exception's message. The previous version did
+    everything in one `try` and then searched the message for "Timeout" or
+    "navigat"; any *other* failure raised after the click -- a closed page, a tab
+    that could not be adopted, a browser that went away -- was reported as
+    `clicked=False, sent=False`, which lands as FAILED. FAILED is the one state a
+    retry may start from, so that was an invitation to re-apply to an employer
+    who may already have the application.
+
+    From `click_attempted` onward the result is therefore always "the click was
+    attempted", and everything downstream treats it as unknown:
+
+    - `pre_click`            -- the control was never found: nothing was sent.
+    - `click_attempted`      -- `click()` raised; it may still have dispatched.
+    - `post_click`           -- the click returned; observing the result failed.
+    """
+    # Phase one: find the control. A failure here is provably before any
+    # external action, so it is the only place "not sent" is knowable.
     try:
         pages_before = list(controller.context.pages)
-        if action.ref:
-            from . import locator as locator_module
+        element, error = await _resolve_final_control(controller, action)
+    except Exception as exc:  # noqa: BLE001 - reported as data, not a crash
+        return {
+            "phase": "pre_click",
+            "clicked": False,
+            "settled": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if element is None:
+        return {"phase": "pre_click", "clicked": False, "settled": False, "error": error}
 
-            element = await locator_module.resolve_ref(controller.page, action.ref)
-            if element is None:
-                return {"clicked": False, "error": f"unresolvable ref {action.ref!r}"}
-        else:
-            from . import locator as locator_module
-
-            element = await locator_module.find_button(controller.page, action.name)
-            if element is None:
-                return {"clicked": False, "error": f"no button named {action.name!r}"}
+    # Phase two: press it. Playwright raises for actionability and timeout waits
+    # as well as for a page that changed underneath the dispatch, so a raising
+    # click cannot be reported as "never happened".
+    try:
         await element.click(timeout=15000, no_wait_after=True)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "phase": "click_attempted",
+            "clicked": True,
+            "settled": False,
+            "sent_possible": True,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    # Phase three: look at what happened. The request has already left the
+    # machine; nothing here may lower that to "not sent".
+    try:
         await asyncio.sleep(0.6)
         new_tab = await controller._adopt_new_tabs(pages_before)
-        return {"clicked": True, "settled": True, "new_tab": new_tab, "url": controller.page.url}
-    except Exception as exc:  # noqa: BLE001 - any click failure is data, not a crash
-        # A click that reached the page and then timed out while the browser
-        # waited for the navigation cannot be called "failed": the request has
-        # already left the machine. The honest word for it is unknown, and it is
-        # the exact case `submission_unknown` exists for.
-        #
-        # This is why the click uses `no_wait_after`: waiting here would hang on
-        # a slow employer and *then* throw, after the request had been sent.
-        message = f"{type(exc).__name__}: {exc}"
-        if isinstance(exc, Exception) and ("Timeout" in message or "navigat" in message.lower()):
-            return {"clicked": True, "settled": False, "error": message}
-        return {"clicked": False, "settled": False, "error": message}
+        return {
+            "phase": "post_click",
+            "clicked": True,
+            "settled": True,
+            "sent_possible": True,
+            "new_tab": new_tab,
+            "url": controller.page.url,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "phase": "post_click",
+            "clicked": True,
+            "settled": False,
+            "sent_possible": True,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 async def reconcile_submission(
