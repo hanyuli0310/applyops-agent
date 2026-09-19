@@ -128,6 +128,7 @@ def create_app(
             state.demo_ats.stop()
 
     app = FastAPI(title="ApplyOps", version=APP_VERSION, lifespan=lifespan)
+    app.state.applyops = state  # reachable for the CLI's demo bootstrap
 
     # ── status / diagnostics ─────────────────────────────────────────
 

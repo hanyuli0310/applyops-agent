@@ -35,16 +35,15 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-from typing import Optional
 
 from .. import concurrency
 from ..authorization import SubmissionAuthorizer
 from ..browser import BrowserController
 from ..guardrails import Guardrails
 from ..ledger import Ledger
-from ..service import ApplicationService
 from ..memory import MemoryStore
-from ..platforms.naming import platform_for_url  # noqa: F401 - re-exported
+from ..platforms.naming import platform_for_url
+from ..service import ApplicationService
 
 # Where this machine's state lives. Overridable so tests (and later a packaged
 # install) can point at a directory the user chose, rather than at whatever the
@@ -83,7 +82,7 @@ class BrowserBusy(RuntimeError):
 class Runtime:
     """Holds the long-lived objects the tools operate on."""
 
-    def __init__(self, data_dir: Optional[Path] = None):
+    def __init__(self, data_dir: Path | None = None):
         root = data_dir or default_data_dir()
         self.data_dir = Path(root)
         self.memory = MemoryStore(self.data_dir / "memory.json")
@@ -96,7 +95,7 @@ class Runtime:
         # The unified application core, built lazily: importing this module
         # must not create app.sqlite in anyone's data directory.
         self._service: ApplicationService | None = None
-        self._browser: Optional[BrowserController] = None
+        self._browser: BrowserController | None = None
         self._lock = asyncio.Lock()
         # Guards `data/browser-profile` against every other process on this
         # machine, not just against other calls in this one. Non-blocking: see
@@ -112,7 +111,7 @@ class Runtime:
         return self._lock
 
     @property
-    def browser(self) -> Optional[BrowserController]:
+    def browser(self) -> BrowserController | None:
         return self._browser
 
     @property

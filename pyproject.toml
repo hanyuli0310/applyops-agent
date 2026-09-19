@@ -1,6 +1,6 @@
 [project]
 name = "applyops-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Harness-agnostic auto-apply: browser hands + a learning memory, exposed as an MCP server"
 readme = "README.md"
 license = { text = "MIT" }
@@ -39,6 +39,7 @@ dev = [
 ]
 
 [project.scripts]
+applyops = "applyops.main:main"
 applyops-mcp = "applyops.mcp.server:main"
 applyops-init = "applyops.cli:init_main"
 

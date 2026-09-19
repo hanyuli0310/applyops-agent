@@ -34,9 +34,15 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from .. import discovery
-from ..action_policy import ClickClass, decide_click
+from ..action_policy import decide_click
 from ..browser import BrowserController
+from ..evidence import (
+    detect_final_action,
+    evidence_platform,
+    success_patterns_for,
+)
 from ..memory import extract_job_id
+from ..platforms.naming import platform_for_url
 from ..resume import (
     ResumeError,
     ResumeRef,
@@ -50,12 +56,6 @@ from ..submission import (
 from ..submission import (
     reconcile_submission as reconcile_submission_impl,
 )
-from ..evidence import (
-    detect_final_action,
-    evidence_platform,
-    success_patterns_for,
-)
-from ..platforms.naming import platform_for_url
 from .runtime import BrowserBusy, Runtime
 
 # A tool call that blocks this long is a bug, not a rate limit.

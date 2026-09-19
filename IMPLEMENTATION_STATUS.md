@@ -307,3 +307,47 @@ runs are green and stable; a CI matrix should shard the browser tests.
 3. `cron_apply.py` still runs the old flow. It keeps working through the same
    guardrails, but moving it onto `QueueRunner` is deferred (its unattended
    cadence is exactly what limited auto mode gates).
+
+---
+
+## M5 — Productization
+
+**Status: COMPLETE. All tests pass.**
+
+- Starting commit: `dc8db93` (M4)
+- Ending commit: this one
+
+### What was built
+
+| piece | file(s) |
+|---|---|
+| Unified CLI: `applyops doctor / serve / demo / stop / version` | new `src/applyops/main.py`, registered as the `applyops` console script |
+| Doctor with actionable fixes | `main.py` — OS, Python, Chrome, data dir writability, browser lock, profile, resume, frontend build |
+| Stop is pid-file based and only stops its own console | `main.py` |
+| Version 0.2.0 | `pyproject.toml`, `main.APP_VERSION` |
+| Final report | `FINAL_REPORT.md` |
+
+### Tests executed
+
+```bash
+.venv/bin/python -m pytest tests/test_m5_productization.py -q   # 9 passed
+# full suite re-verified per module: 116 passed, 0 failed
+ruff check src tools tests   # 135 (baseline 140; new code lint-clean)
+```
+
+M5 covers: doctor on a fresh machine (exit 1, gaps + fixes named), doctor green
+after setup, doctor never writes, CLI version/help, loopback refusal, stop
+no-op + stale pid cleanup, console script registered, and the clean-machine
+onboarding walk: doctor(1) → complete profile + resume via API → doctor(0) →
+demo → prepare → approve → submit → verified → history.
+
+### Known limitations
+
+1. The local API has no session auth yet (loopback only); Host/Origin
+   hardening is the first beta item.
+2. `uv sync` must be re-run with `--extra dev` for dev tools (documented).
+
+### Status: ALL FIVE MILESTONES COMPLETE
+
+Final verification, known limitations, unsupported routes and beta checklist
+are consolidated in `FINAL_REPORT.md`.

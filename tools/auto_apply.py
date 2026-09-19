@@ -822,8 +822,9 @@ async def apply_one(driver: Driver, job: dict, ledger: Ledger, pending: list[dic
         # Resume page: LinkedIn keeps the last upload selected, so only upload
         # when nothing is selected.
         labels = [(f.get("label") or "").lower() for f in fields]
-        if any("resume" in l for l in labels):
-            if not any("deselect resume" in l for l in labels):
+        if any("resume" in l for l in labels) and not any(
+            "deselect resume" in l for l in labels
+        ):
                 up = await driver.call(
                     "upload_file",
                     ref="css=input[type=file]",
