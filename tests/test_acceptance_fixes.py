@@ -14,9 +14,9 @@ import asyncio
 import json
 import subprocess
 import sys
-import urllib.request
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -133,7 +133,7 @@ async def test_mcp_request_grant_is_callable_and_the_approve_channel_exists():
             assert "job" in payload["summary_to_show"]
 
             # The documented human channel must exist: `applyops approve`.
-            listed = subprocess.run(
+            listed = subprocess.run(  # noqa: ASYNC221, PLW1510 - returncode asserted below
                 [sys.executable, "-m", "applyops.main", "--data-dir", str(root), "approve"],
                 capture_output=True,
                 text=True,
@@ -682,7 +682,7 @@ def test_a_new_scoped_answer_voids_a_pending_grant():
 def test_waiting_for_input_names_what_is_missing_and_can_be_resumed():
     root = _tmp()
     _set_up(root)
-    client, app = _client(root)
+    client, _app = _client(root)
     with client:
         demo = client.post("/api/demo/start").json()
         app_id = demo["application"]["id"]

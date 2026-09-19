@@ -418,3 +418,78 @@ weakened: the demo ATS now rejects incomplete applications (M1/M2/M4 tests
 submit complete forms), submitting requires being on the approved page (the
 three-application test interleaves prepare/approve/submit), and `stop` cleans up
 stale pid files instead of assuming ownership.
+
+---
+
+## Blocking fixes (round 2)
+
+Baseline `40c91b2`. Four reported blockers, each with a failing test written
+first, then a minimal fix, then a small local commit. Nothing was pushed or
+merged; `AGENTS.md`'s uncommitted third-party change was left alone.
+
+| blocker | commit | fix | tests |
+|---|---|---|---|
+| 1. MCP flow could not reach a submission; routes disagreed | `505f778` | new public tool `prepare_application`; the prepare work moved into one implementation (`applyops.prepare`) used by MCP, the console and the runner; `platforms.naming.resolve_route` is the single route vocabulary and an unknown posting is `external`, never `demo`; `request_submission_grant` reads job/route/platform from the ledger row | `tests/test_blocker_mcp_flow.py` (3) |
+| 2. Yes/No options answered each other | `defcb37` | the page-wide "contains sponsor" heuristic is gone; the locator exposes each control's *question* (fieldset legend / ARIA group) and its form `name`; radio refs are `[name][value]` and the dedupe key includes the group, so three Yes/No groups on one page are three controls; filling resolves per question and parks an unanswered one by name | `tests/test_blocker_choice_groups.py` (3) |
+| 3. reconcile confirmed applications with another posting's evidence; failures guessed | `8ed024d` | reconcile takes the expected page identity and only counts evidence on the page the attempt was made from; MCP reconcile goes through the service and requires an application id; evidence-read failure after the click is unverified, an exception after the grant was spent is unverified, only a pre-consume exception is FAILED, and a bookkeeping failure keeps the real outcome | `tests/test_blocker_reconcile_binding.py` (6) |
+| 4. drivers shared one page; the interval was ignored outside MCP | `32b767f` | every page-touching console route takes `AppState.page_lock` (asserted structurally for both the console and MCP); `service.submit` waits `preflight.wait_seconds` (bounded) and **re-checks the rails afterwards**, refusing before the claim so nothing is sent and no approval is burned | `tests/test_blocker_concurrency.py` (7) |
+
+### Found while fixing these
+
+1. `label=No` resolved to the "Notice period" field, and the three radio groups
+   of the new screening page collapsed into one at collection time — the
+   reported cross-answering started *before* the filler ran.
+2. The demo ATS never counted submissions, so "the request was actually sent"
+   could not be asserted; the first version of the unknown-result test passed for
+   the wrong reason (a browser-blocked form that was never posted).
+3. The acceptance test titled "three applications, three grants" was asserting
+   three immediate submissions — i.e. exactly the missing interval this round
+   was about. It now sets the gap to zero for its own purpose, and the interval
+   has its own tests.
+
+### Behaviour changes to be aware of
+
+- A submission that arrives too early now **waits** out the rails' interval
+  (bounded by `MAX_INLINE_WAIT_SECONDS`, 60s) and re-checks; if more time is
+  still required it is refused *before* the claim. Previously the console
+  ignored the interval entirely.
+- `resolve_route` labels anything that is not the local demo ATS or LinkedIn as
+  `external`; those applications can be read and parked but not driven.
+
+### Test results
+
+| suite | result | exit |
+|---|---|---|
+| `tests/test_core.py` | 10 passed | 0 |
+| `tests/test_concurrency.py` | 12 passed | 0 |
+| `tests/test_m1_trusted_execution.py` | 40 passed | 0 |
+| `tests/test_m2_unified_core.py` | 23 passed | 0 |
+| `tests/test_m3_local_ui.py` | 9 passed | 0 |
+| `tests/test_m4_supervised_automation.py` | 13 passed | 0 |
+| `tests/test_m5_productization.py` | 9 passed | 0 |
+| `tests/test_acceptance_fixes.py` | 25 passed | 0 |
+| `tests/test_blocker_mcp_flow.py` | 3 passed | 0 |
+| `tests/test_blocker_choice_groups.py` | 3 passed | 0 |
+| `tests/test_blocker_reconcile_binding.py` | 6 passed | 0 |
+| `tests/test_blocker_concurrency.py` | 7 passed (run in batches: 2 structural + 5, and 1 + 1 for the interval pair) | 0 per batch |
+| frontend `npx vitest run` | 7 passed | 0 |
+| frontend `npm run build` / `tsc --noEmit` | clean | 0 |
+| `ruff check src tools tests` | 134 findings, all pre-existing debt (baseline 138) | 1 |
+
+Not run as a single process: `tests/test_blocker_concurrency.py` in one go, and
+the whole suite in one go. Both are killed by this sandbox's memory cap (exit
+137) once enough headless Chromes accumulate. Every suite above was run to
+completion in its own process, and the two batches cover the file's 7 tests.
+
+### Remaining blockers
+
+1. There is still no user authentication on the loopback API (Host/Origin/token
+   only). Single-user machine, so nobody to authenticate against — first beta item.
+2. `cron_apply.py` / `auto_apply.py` remain on the legacy flow; the runner has
+   not replaced them.
+3. Only the local demo ATS and LinkedIn Easy Apply have a submission path.
+   Everything else is `external`: read, prepare, park.
+4. The field label map is still fixed plus the sponsorship rule; an ATS with
+   unusual labels parks for a human (intended) but needs per-route knowledge to
+   be pleasant.
+5. The console still polls every 5 seconds (no SSE).
