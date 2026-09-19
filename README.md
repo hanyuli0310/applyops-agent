@@ -4,6 +4,8 @@
 
 No model, no API key, no agent loop of its own — the brain is your harness.
 
+**New here?** Follow [Zero to first application](#zero-to-first-application) below — every step is copy-pasteable and says what you should see.
+
 [English](#english) · [中文](#中文)
 
 ---
@@ -23,128 +25,112 @@ ApplyOps is **not** an agent. It is an **MCP server** exposing 32 tools that any
 
 Everything else is the harness's job: planning, reading a difficult page, handling the unexpected, talking to you.
 
-### Why this shape
+In plain terms: **you talk to your AI assistant, and ApplyOps is what lets it actually open a browser and submit the form for you.**
 
-The first version of this project owned the brain: an agent loop plus three pluggable LLM providers plus a web UI. The problem was not the code quality, it was the **placement**:
+<a id="zero-to-first-application"></a>
 
-| The old design's burden | After moving the brain out |
-|---|---|
-| It called a model, so it needed an API key | Gone — the harness owns the brain |
-| Three LLM adapters, plus model-retirement drift | Entire layer deleted |
-| An agent loop, so it spun without a timeout | MCP is request/response: no loop, no spinning |
-| A hand-built web UI | The MCP client *is* the front end |
+### Zero to first application
 
-What is left are the only two things that survive a change of harness: the browser layer and the learning memory. `legacy/` holds the retired v1 as a rollback point.
+All commands run in a terminal (Terminal.app on macOS). Each step ends with what you should see — if you don't, jump to [Troubleshooting](#troubleshooting).
 
-### Requirements
-
-- macOS or Linux, Python **≥ 3.12**
-- [`uv`](https://docs.astral.sh/uv/)
-- **Google Chrome** (installed by Playwright — not bundled Chromium; importing a LinkedIn session needs a real Chrome profile)
-- A **LinkedIn account** for the Easy Apply path
-
-### Quick start
+**Step 0 — Check your Python.** You need Python **3.12 or newer**:
 
 ```bash
-git clone git@github.com:hanyuli0310/applyops-agent.git
+python3 --version        # needs to say 3.12 or higher
+```
+
+**Step 1 — Install `uv`** (a tool that manages Python dependencies for you; it will also install a matching Python if needed):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Then **close and reopen your terminal** so the `uv` command is found.
+
+**Step 2 — Get the code and install everything:**
+
+```bash
+git clone https://github.com/hanyuli0310/applyops-agent.git
 cd applyops-agent
 
-uv sync                                  # creates .venv/
-uv run playwright install chrome
-
-.venv/bin/applyops-init                  # answers every question a form will ask
-
-.venv/bin/python tools/import_chrome_session.py --list     # find your logged-in Chrome profile
-.venv/bin/python tools/import_chrome_session.py --verify   # confirm the session came across
-
-.venv/bin/applyops-mcp                   # serve over stdio; register this in your harness
+uv sync                                  # creates .venv/ and installs dependencies
+uv run playwright install chrome         # installs the real Google Chrome it drives
 ```
 
-Then check it works before trusting it:
+> No `git`? Click **Code → Download ZIP** on the GitHub page instead, unzip it, and `cd` into the folder.
+
+**Step 3 — Tell it who you are.** Run the setup wizard:
 
 ```bash
-.venv/bin/python tools/op.py ping '{}'            # server reachable
-.venv/bin/python tools/op.py setup_status '{}'    # profile complete?
-.venv/bin/python -m pytest tests/ -q              # 22 tests, ~6s
+.venv/bin/applyops-init
 ```
 
-`tools/op.py <tool> '<json>'` calls exactly one tool from the shell, against the real server with all the real guardrails. It is the fastest way to drive a single step by hand.
+It asks, one question at a time, everything a job form will ever ask — name, email, phone, work authorization, salary expectations, and so on. Three things to know:
 
-### First run
+- **Enter** keeps the current value, `-` clears one, **Ctrl-C quits anytime** — answers are saved after *every* question, so you can rerun the command later and it resumes instead of restarting.
+- Anything you leave blank stays blank, and the system will **ask you when it reaches that field** rather than guess. Salary and visa status are exactly where a confident wrong answer causes real harm.
+- Your answers live in `data/profile.md` — an ordinary markdown file you can open and edit by hand at any time. All 34 fields are explained in [`profile.example.md`](profile.example.md).
 
-Nothing needs configuring by hand. On the first `setup_status()` call the server reports the profile as incomplete and returns a `questionnaire`; the harness asks you those questions in one batch and writes the answers back. If you would rather answer them in a terminal, `applyops-init` walks the same fields — both paths are generated from a single field definition, so they cannot drift apart.
+**Step 4 — Bring your LinkedIn login over.** Easy Apply needs a logged-in session. Reuse the one your Chrome already has:
 
-Answers that the system cannot know stay blank. **A blank field means "you have not said", and every layer is forbidden from guessing.** Salary, visa status, work authorization and legal declarations are exactly the cases where a confident wrong answer causes real harm.
-
-### Your profile
-
-Your facts live in one hand-editable markdown file, `data/profile.md`:
-
-```markdown
-## Identity
-
-- name: Jane Doe
-- email: you@example.com
-- phone:  <!-- What is your mobile number, with country code? -->
+```bash
+.venv/bin/python tools/import_chrome_session.py --list                      # find the Chrome profile you use
+.venv/bin/python tools/import_chrome_session.py --domains linkedin.com --verify   # confirm the session came across
 ```
 
-- `- field: value`, one per line. An empty value followed by an HTML comment is a question the system will ask you.
-- Edits take effect immediately; no command needs re-running.
-- All 34 fields, each with an explanation of *why it is asked*, are documented in **`profile.example.md`**.
+> Skipped or it failed? Nothing breaks — the first time an application needs it, the browser will simply show a LinkedIn login page and you sign in once by hand.
 
-It is a separate file from `memory.json` on purpose. `memory.json` holds what the system **learned** — it must keep accumulating and should not be hand-edited. The profile holds what only **you** know, and you will want to correct it. Two files, two lifecycles.
+**Step 5 — Register the server in your AI harness.** This tells your AI assistant that ApplyOps exists. Point it at the `applyops-mcp` command **inside this project** (use the full absolute path):
 
-Both live under `data/`, which is git-ignored in full — so your resume can go there too and cannot be committed by accident.
+```json
+{
+  "mcpServers": {
+    "applyops": {
+      "command": "/FULL/PATH/TO/applyops-agent/.venv/bin/applyops-mcp"
+    }
+  }
+}
+```
 
-### The invariants
+- **Claude Code**: `claude mcp add applyops -- /FULL/PATH/TO/applyops-agent/.venv/bin/applyops-mcp`
+- **Codex**: add the same command under `[mcp_servers.applyops]` in `~/.codex/config.toml`
+- Any other harness: the JSON above, in whatever place it accepts MCP servers.
 
-Five rules the code is built around. Breaking one produces something that looks like it works.
+You can also test the server by itself, without any harness:
 
-1. **The flywheel records inside the tools, never in the caller.** `fill_field` has no three-argument form. If recording lived in the caller, a different agent loop would silently starve the memory while `memory.json` still looked healthy.
-2. **Submission requires a one-time confirmation token.** No token, no submission — the only place that actually catches a mis-filled form.
-3. **A blank profile field is asked about, never guessed.** See above.
-4. **`selectors_suggested` must be non-zero after real runs.** It is the only signal separating "never tried" from "tried and always failed" — both show `hit_rate: 0`. A permanently zero value means the memory is dead.
-5. **Human-required gates are declared up front**, in the route, before the form is opened.
+```bash
+.venv/bin/python tools/op.py ping '{}'            # → the server replies
+.venv/bin/python tools/op.py setup_status '{}'    # → is your profile complete?
+.venv/bin/python -m pytest tests/ -q              # → 22 tests pass, ~6s
+```
 
-### Route knowledge: Easy Apply is the easy case
+**Step 6 — Apply.** Open your AI assistant and just say it in one sentence:
 
-Selector memory answers "what does the button look like", and silently assumes the form is on the page you already have open. That assumption is wrong. LinkedIn Easy Apply does stay put; `amazon.jobs` hands you to `passport.amazon.jobs`, where a sign-in — usually verified by an emailed one-time code — stands in front of the *first* input field.
+> 帮我投递这个岗位：https://www.linkedin.com/jobs/view/XXXX
 
-So knowledge is split into two layers, both keyed `<platform>/<route>`:
+That's it. The agent calls `preflight` (daily cap / pacing / have-you-already-applied), `route_guide` (which route this posting takes), opens the real browser, fills the form from your profile and its memory, and shows you a **full summary of every field** before asking you to confirm submission. Nothing is ever submitted without your one-time confirmation.
 
-| layer | question it answers | example |
+The first application will ask you a few things the memory doesn't know yet. The second asks fewer. That's the flywheel.
+
+### Troubleshooting
+
+| What you see | What it means | What to do |
 |---|---|---|
-| selectors (`platforms`) | how do I locate this element | 3 candidates for `submit_button` |
-| routes (`routes`) | how many steps, what does it need, which step needs a human | `Amazon/external_ats`: 8 steps, 1 `human_required` |
+| `command not found: uv` | The install script finished but your shell hasn't reloaded | Close and reopen the terminal; or run `source ~/.cargo/env` |
+| Python says 3.11 or lower | Too old | `uv sync` will fetch its own Python — just make sure you ran it, and use `.venv/bin/python` everywhere |
+| `applyops-init` prints questions but Enter does nothing | You're pasting into the wrong window | Run it in a real terminal, not inside some other tool |
+| `browser_busy: true` | Another driver (unattended loop, another chat) holds the Chrome profile | Wait for it to finish; the message names the holder. Don't retry in a loop |
+| A fill reports `mismatch: true` | The page rejected the value | It is **not** filled — fix the value and refill; never treat it as done |
+| LinkedIn login page appears mid-run | Step 4 was skipped or the session expired | Sign in once by hand in the opened browser; it persists in `data/browser-profile/` |
+| Server "not found" in the harness | Wrong command path, or not absolute | Use the **absolute** path of `.venv/bin/applyops-mcp` inside this project |
 
-A route record carries `entry_signature` (how to recognise the route), `prerequisites`, `steps[]`, and the flywheel counters `runs` / `successes` / `blocked_at`. **`blocked_at` is more useful than the success rate**: the rate says a route is hard, `blocked_at` says *which gate* it dies at — which is where the next adapter gets written.
+### Daily use
 
-`route_guide(job_url)` returns all of this *before* the form is opened, so the human-required gates can be batched into the same question set as the profile answers rather than discovered halfway through.
+Once the first application has gone through, the two everyday patterns are:
 
-### One browser at a time
+**Keep using it by conversation.** Paste a job URL into your AI assistant. Same flow, fewer questions each time.
 
-"A single user" on this machine is really **at least three processes**: the MCP server your harness is talking to, the unattended loop, and you in a terminal. They share one `data/` and **one Chrome profile**, because the logged-in session is the one thing this project cannot rebuild for itself.
-
-Two Chromes on one profile do not slow each other down — they overwrite each other's cookie database. So the profile has an exclusive lock and there is exactly one driver; a second one is refused with `browser_busy: true` naming the holder.
-
-The state files are a different problem, and get a different mechanism:
-
-| file | mechanism | accuracy |
-|---|---|---|
-| `guard_state.json` — daily cap, breaker, tokens | lock + read-modify-write | **exact**: 12 processes racing a cap of 5, exactly 5 get through |
-| `memory.json` — the flywheel | lock + **merge**-on-write | no record lost; counters take the max |
-| `application_log.json` — the ledger | same lock, merged by posting | no row lost or duplicated |
-
-Deliberate choices:
-
-- **`flock`, not pid files.** The kernel releases the lock however a process dies, `SIGKILL` included. So there is no stale-lock cleanup anywhere, and nothing has to answer the unanswerable question "is that pid still alive" — pids get recycled.
-- **The lock is inheritable.** `flock` is held per open file description, so a child process's own `acquire()` is refused while its parent holds it. Every phase of an unattended pass is a child process, which is exactly why that loop once failed all three phases per pass. The parent now passes the descriptor down with `pass_fds`; the child recognises the same lock and proceeds without unlocking.
-- **Merge, so not every writer has to be well-behaved.** A lock only stops processes that ask for it — not old code, not a throwaway script. Merge-on-write makes such writers survivable: the next save writes their records back, and `version` takes the max, so a schema rollback cannot outlive one save.
-- **The cap's critical section is the browser lock.** "Decide → apply → record" sits inside one lock, so no separate reservation state is needed — reservations leak (a pass with 15 skips has no point at which to give one back).
-
-`tests/test_concurrency.py` genuinely spawns processes: 8 writers on one file losing nothing, 12 processes racing a cap of 5, 4 processes spending one token, and a holder killed with `SIGKILL` releasing the lock immediately.
-
-### Unattended runs
+**Unattended mode** — a supervised loop that discovers and applies on a schedule:
 
 ```bash
 .venv/bin/python tools/cron_apply.py --dry-run    # rails + browser only, no applications
@@ -153,13 +139,59 @@ Deliberate choices:
 .venv/bin/python tools/cron_apply.py --stop
 ```
 
-Run `--dry-run` first, and watch the first real submission. The loop drives the same Chrome profile you do.
+Run `--dry-run` first, and watch the first real submission — the loop drives the same Chrome profile you do.
 
-### Privacy
+### What your data looks like
 
-The repository contains **no personal data of any kind**. No default name, email, phone, salary or location — `applyops-init` asks for all of it. `data/` is git-ignored in full, including the browser profile and its live session cookies.
+Everything mutable is under `data/`, which is **git-ignored in full**:
 
-The selectors and route seeds that *do* ship are public knowledge, not anyone's data: they give the first user a head start on their very first application, and are then corrected by real hit rates.
+| path | contents | safe to delete? |
+|---|---|---|
+| `data/profile.md` | your facts, as a hand-editable markdown file | no — that is your work |
+| `data/memory.json` | the flywheel: learned answers, selector scores, history, route knowledge | no |
+| `data/guard_state.json` | today's count, breaker, outstanding confirmation tokens | yes |
+| `data/browser-profile/` | the live Chrome profile, **including session cookies** | yes, then re-import |
+
+The repository itself contains **no personal data of any kind** — no default name, email, phone, salary or location. Keep it that way.
+
+### Why this shape
+
+The first version of this project owned the brain: an agent loop, pluggable LLM providers, a web UI. Moving the brain out removed the API-key requirement, the provider-drift problem, and the entire front end in one stroke. What survives a change of harness is exactly what remains here: the browser layer and the learning memory. `legacy/` holds the retired v1 as a rollback point.
+
+### The invariants
+
+Five rules the code is built around. Breaking one produces something that *looks* like it works.
+
+1. **The flywheel records inside the tools, never in the caller.**
+2. **Submission requires a one-time confirmation token** — the only real guard against a mis-filled form.
+3. **A blank profile field is asked about, never guessed** — salary, visa status, work authorization and legal declarations are where a confident wrong answer causes real harm.
+4. **`selectors_suggested` must be non-zero after real runs** — the only signal separating "never tried" from "tried and always failed".
+5. **Human-required gates are declared up front**, in the route, before the form is opened.
+
+### Route knowledge: Easy Apply is the easy case
+
+LinkedIn Easy Apply stays on the posting page. `amazon.jobs` hands you to `passport.amazon.jobs`, where a sign-in — usually confirmed by an emailed one-time code — stands in front of the *first* input field. So knowledge is split into two layers, keyed `<platform>/<route>`:
+
+| layer | question it answers |
+|---|---|
+| selectors (`platforms`) | how do I locate this element |
+| routes (`routes`) | how many steps, what does it need, which step needs a human |
+
+`route_guide(job_url)` returns all of this *before* the form is opened, so human-required gates (one-time codes, captchas, account passwords) get batched into the same question set as the profile answers rather than discovered halfway through. A route record also carries flywheel counters — `blocked_at` says *which gate* a route dies at, which is where the next adapter gets written.
+
+### One browser at a time
+
+Several processes share one Chrome profile, because the logged-in session is the one thing this project cannot rebuild for itself. Two Chromes on one profile do not slow each other down — they **overwrite each other's cookie database**. So the profile has an exclusive lock and there is exactly one driver; a second one is refused with `browser_busy: true` naming the holder.
+
+State files use lock + write — and merge, so that even a misbehaving writer cannot lose data:
+
+| file | mechanism | accuracy |
+|---|---|---|
+| `guard_state.json` — daily cap, breaker, tokens | lock + read-modify-write | **exact**: 12 processes racing a cap of 5, exactly 5 get through |
+| `memory.json` — the flywheel | lock + **merge**-on-write | no record lost; counters take the max |
+| `application_log.json` — the ledger | same lock, merged by posting | no row lost or duplicated |
+
+Locks are `flock`, not pid files: the kernel releases them however a process dies (`SIGKILL` included), so there is no stale-lock cleanup anywhere and no code that has to answer "is that pid still alive". `tests/test_concurrency.py` genuinely spawns processes to prove all of the above.
 
 ### License
 
@@ -182,128 +214,114 @@ ApplyOps **不是** agent。它是一个 **MCP server**，对外暴露 32 个工
 
 其余的归 harness：规划、看难页、处理意外、跟你对话。
 
-### 为什么是这个形态
+说人话就是：**你跟你的 AI 助手对话，ApplyOps 让它真的能打开浏览器、替你把表单填好提交。**
 
-这个项目的第一版自带大脑：agent 循环 + 三个可插拔 LLM provider + 一个 Web UI。问题不在代码质量，而在**位置**：
+<a id="zero-to-first-application-zh"></a>
 
-| 原设计的负担 | 把大脑搬出去之后 |
-|---|---|
-| 自己调模型 → 要 API Key | 没有了，大脑归 harness |
-| 三个 LLM 适配器，加上模型退役漂移 | 整层删除 |
-| agent 循环 → 无超时地空转 | MCP 是请求／响应：没有循环就没有空转 |
-| 自己造的 Web UI | MCP client 就是前端 |
+### 从零到第一次投递
 
-留下的只有两件**换任何一个 harness 都不会消失**的东西：浏览器层，和学习型记忆。`legacy/` 是退役的 v1，作为回滚点保留。
+以下命令都在终端（macOS 的「终端」App）里执行。每一步都写了「你应该看到什么」，看不到就跳到[常见问题](#常见问题)。
 
-### 环境要求
-
-- macOS 或 Linux，Python **≥ 3.12**
-- [`uv`](https://docs.astral.sh/uv/)
-- **Google Chrome**（由 Playwright 安装 —— 不是打包的 Chromium；导入 LinkedIn 登录态需要真实的 Chrome profile）
-- 走 Easy Apply 需要一个 **LinkedIn 账号**
-
-### 快速开始
+**第 0 步 —— 检查 Python。** 需要 **3.12 或更新**：
 
 ```bash
-git clone git@github.com:hanyuli0310/applyops-agent.git
+python3 --version        # 要显示 3.12 或更高
+```
+
+**第 1 步 —— 安装 `uv`**（帮你管理 Python 依赖的工具，缺 Python 时它还能自动装一个）：
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+装完后**关掉终端重新打开**，`uv` 命令才能被找到。
+
+**第 2 步 —— 拿到代码，装好一切：**
+
+```bash
+git clone https://github.com/hanyuli0310/applyops-agent.git
 cd applyops-agent
 
-uv sync                                  # 建出 .venv/
-uv run playwright install chrome
-
-.venv/bin/applyops-init                  # 逐项问一遍填表要用的信息
-
-.venv/bin/python tools/import_chrome_session.py --list     # 找出你已登录的 Chrome profile
-.venv/bin/python tools/import_chrome_session.py --verify   # 确认登录态搬过来了
-
-.venv/bin/applyops-mcp                   # stdio 起服务，在你的 harness 里注册它
+uv sync                                  # 建出 .venv/ 并安装依赖
+uv run playwright install chrome         # 安装它要驱动的真实 Chrome
 ```
 
-然后先验证再信任：
+> 不会用 `git`？在 GitHub 页面点 **Code → Download ZIP**，解压后 `cd` 进文件夹就行。
+
+**第 3 步 —— 告诉它你是谁。** 运行设置向导：
 
 ```bash
-.venv/bin/python tools/op.py ping '{}'            # 服务能通
-.venv/bin/python tools/op.py setup_status '{}'    # 档案齐了没
-.venv/bin/python -m pytest tests/ -q              # 22 项测试，约 6 秒
+.venv/bin/applyops-init
 ```
 
-`tools/op.py <tool> '<json>'` 在 shell 里调用**恰好一个**工具，走的是真实 server 与真实护栏。手动驱动某一步，这是最快的路径。
+它会把填表可能问到的一切逐项问你：姓名、邮箱、电话、工作授权、期望薪资……三件事要知道：
 
-### 首次运行会发生什么
+- **直接回车** = 保留当前值，输入 `-` = 清空这一项，**Ctrl-C 随时退出** —— 每答完一题就立刻保存，所以中途退出再跑会**接着来**，不用从头答。
+- 你留空的就真的是空的，系统到那个字段时会**来问你**，绝不替你猜。薪资、签证状态正是「自信地答错会造成实害」的地方。
+- 答案写在 `data/profile.md` —— 一个普通的 markdown 文件，随时可以打开手改。全部 34 个字段的解释见 [`profile.example.md`](profile.example.md)。
 
-没有需要手工配置的东西。第一次调 `setup_status()` 时，server 会报「档案不完整」，并返回一份 `questionnaire`；harness 一次把这些问题问完，答案再写回去。你也可以在终端里跑 `applyops-init` 走同一批字段 —— 两条路径由同一份字段定义生成，不可能不一致。
+**第 4 步 —— 把 LinkedIn 登录态搬过来。** Easy Apply 需要已登录的会话，直接复用你 Chrome 里现成的那个：
 
-系统无法知道的信息留空。**留空代表「你还没说」，任何一层都禁止猜。** 薪资、签证状态、工作授权、法律声明，恰恰是「自信地答错」会造成实害的几类。
-
-### 你的档案
-
-你的个人信息存在**一个可以手改的 markdown 文件**里：`data/profile.md`。
-
-```markdown
-## 身份
-
-- name: Jane Doe
-- email: you@example.com
-- phone:  <!-- What is your mobile number, with country code? -->
+```bash
+.venv/bin/python tools/import_chrome_session.py --list                      # 找出你在用的 Chrome profile
+.venv/bin/python tools/import_chrome_session.py --domains linkedin.com --verify   # 确认登录态搬过来了
 ```
 
-- 每行 `- 字段名: 值`。空值后面跟着一句 HTML 注释，代表「这里该填什么、系统会来问你」。
-- 改完立即生效，不需要重跑任何命令。
-- 全部 34 个字段，每个都附「为什么要问」，见 **`profile.example.md`**。
+> 没做这一步或者失败了？不影响 —— 第一次真投递时浏览器会停在 LinkedIn 登录页，你手动登录一次就好。
 
-它和 `memory.json` 是两个文件，这是有意的：`memory.json` 装的是系统**学到**的东西，必须持续累积、**不该被人手改**；档案装的是只有**你**知道、而且你会想随时修正的东西。两个文件，两种生命周期。
+**第 5 步 —— 在你的 AI harness 里注册服务。** 这一步是告诉你的 AI 助手「ApplyOps 存在」。把它的启动命令（**绝对路径**）注册进去：
 
-两者都在 `data/` 下，而整个 `data/` 已被 git 忽略 —— 所以简历也可以直接丢进去，不会误提交。
+```json
+{
+  "mcpServers": {
+    "applyops": {
+      "command": "/完整/路径/applyops-agent/.venv/bin/applyops-mcp"
+    }
+  }
+}
+```
 
-### 五条不变式
+- **Claude Code**：`claude mcp add applyops -- /完整/路径/applyops-agent/.venv/bin/applyops-mcp`
+- **Codex**：把同样的命令写进 `~/.codex/config.toml` 的 `[mcp_servers.applyops]`
+- 其他 harness：上面那段 JSON，放到它接受 MCP server 的地方。
 
-代码就是围着这五条写的。破掉任何一条，都会得到一个**看起来能用**的系统。
+不接 harness 也能单独验证服务本身：
 
-1. **飞轮记录在工具内部，不在调用方。** `fill_field` 没有三参数版本。记录逻辑一旦活在调用方，换个 agent 循环就会静默饿死记忆，而 `memory.json` 看起来仍然健康。
-2. **提交必须持有一次性确认令牌。** 没有 token 就提交不了 —— 这是唯一能真正拦住「误提交」的地方。
-3. **档案空值只能问，不能猜。** 见上。
-4. **`selectors_suggested` 在真实跑单后必须非零。** 它是唯一能区分「从没试过」和「试了全失败」的信号（两者的 `hit_rate` 都是 0）。恒为 0 就意味着记忆已经死了。
-5. **人工关卡必须提前声明** —— 写在路由里，在开表单**之前**就拿到。
+```bash
+.venv/bin/python tools/op.py ping '{}'            # → 服务应答
+.venv/bin/python tools/op.py setup_status '{}'    # → 档案齐了没
+.venv/bin/python -m pytest tests/ -q              # → 22 项测试通过，约 6 秒
+```
 
-### 申请路由经验库：Easy Apply 才是简单的那条
+**第 6 步 —— 投递。** 打开你的 AI 助手，一句话：
 
-选择器记忆回答「按钮长什么样」，同时默认了**表单就在你打开的这一页上**。这个假设是错的。LinkedIn Easy Apply 确实不出页面，但 `amazon.jobs` 会把你交给 `passport.amazon.jobs`，那里在**第一个输入框之前**就横着一道登录，而且往往要邮箱验证码。
+> 帮我投递这个岗位：https://www.linkedin.com/jobs/view/XXXX
 
-所以知识分两层，key 都是 `<平台>/<路由>`：
+就是这样。agent 会先跑 `preflight`（每日上限 / 节流 / 查重）、`route_guide`（这条招聘走哪条路），然后打开真实浏览器，用你的档案和它的记忆填表，并在请求你确认前**把每个字段的值完整列给你看**。没有你的一次性确认，任何东西都不会被提交。
 
-| 层 | 回答的问题 | 例子 |
+第一次投递会问你几个记忆里还没有的问题，第二次就更少 —— 这就是飞轮。
+
+<a id="常见问题"></a>
+
+### 常见问题
+
+| 看到什么 | 意味着什么 | 怎么办 |
 |---|---|---|
-| 选择器（`platforms`） | 这个元素怎么定位 | `submit_button` 的 3 个候选 |
-| 路由（`routes`） | 几步、前提是什么、哪一步必须人来做 | `Amazon/external_ats`：8 步，其中 1 步 `human_required` |
+| `command not found: uv` | 安装成功了但 shell 没刷新 | 关掉终端重开；或 `source ~/.cargo/env` |
+| Python 显示 3.11 或更低 | 版本太老 | 直接跑 `uv sync`，它会自己装一个合适的 Python —— 之后统一用 `.venv/bin/python` |
+| `applyops-init` 在提问但按回车没反应 | 你把命令敲进了别的工具的窗口 | 用真正的终端跑它 |
+| 返回 `browser_busy: true` | 另一个驱动（无人值守循环、另一个会话）占着 Chrome profile | 等它跑完；报错里写了持有者是谁，别循环重试 |
+| 某次填写返回 `mismatch: true` | 页面拒绝了这个值 | 它**没**填进去 —— 改值重填，永远别当它已填好 |
+| 跑到一半出现 LinkedIn 登录页 | 第 4 步没做或会话过期 | 在打开的浏览器里手动登录一次，会话会留在 `data/browser-profile/` |
+| harness 里找不到服务 | 命令路径不对，或不是绝对路径 | 用项目里 `.venv/bin/applyops-mcp` 的**绝对路径** |
 
-一条路由记录带 `entry_signature`（怎么认出这条路）、`prerequisites`（动手前得有什么）、`steps[]`，以及飞轮计数 `runs` / `successes` / `blocked_at`。**`blocked_at` 比成功率有用**：成功率只能说「这条路难」，`blocked_at` 说「死在哪道闸门」—— 下一个适配器就从这句话写起。
+### 日常使用
 
-`route_guide(job_url)` 在**开表单之前**返回这些，所以人工关卡能和档案问题一起批量问掉，而不是填到一半才发现。
+第一次投递跑通后，日常就两种用法：
 
-### 一次只开一个浏览器
+**继续用对话。** 把岗位链接丢给 AI 助手，流程同上，问题一次比一次少。
 
-这台机器上的「一个用户」其实**至少是三个进程**：harness 正在对话的 MCP server、无人值守的定时跑单、还有你在终端里手敲的那条。它们共用一个 `data/` 和**同一个 Chrome profile** —— 因为登录态是这个项目唯一自己造不出来的东西。
-
-两个 Chrome 挤一个 profile 不是「慢一点」，是互相重写 cookie 数据库。所以 profile 有独占锁，同一时刻只有一个驱动；第二个会被拒绝，返回 `browser_busy: true` 并报出持有者是谁。
-
-状态文件是另一类问题，用另一套机制：
-
-| 文件 | 机制 | 精确度 |
-|---|---|---|
-| `guard_state.json` —— 每日上限 / 熔断 / 令牌 | 锁 + 读—改—写 | **精确**：12 个进程抢 5 个名额，结果就是 5 |
-| `memory.json` —— 飞轮 | 锁 + **合并写** | 记录一条不丢；计数器取 max |
-| `application_log.json` —— 台账 | 同一把锁，按 posting 合并 | 一条不丢、不重复 |
-
-几个刻意的选择：
-
-- **用 `flock`，不用 pid 文件。** 内核在进程以任何方式退出时释放锁（含 `SIGKILL`）。所以项目里**没有**陈旧锁清理，也没有任何地方需要回答「那个 pid 还活着吗」—— 这个问题没有安全答案，pid 会被回收。
-- **锁可以交给子进程。** `flock` 按 open file description 持有，父进程持有时子进程自己 `acquire()` 会被内核拒绝。无人值守跑单的每个 phase 都是子进程 —— 这正是它曾经**每轮三个 phase 全部失败**的原因。现在父进程用 `pass_fds` 把描述符传下去，子进程认出「同一把锁」直接放行且不解锁。
-- **合并，所以不要求所有写者都守规矩。** 锁只能拦住**主动请求**它的进程 —— 老版本代码、临时脚本拦不住。合并写让这类写者变得**可幸存**：下一次保存会把它不认识的记录替它写回去，`version` 取 max，所以 schema 回退活不过一次保存。
-- **限额的临界区就是浏览器锁。** 「判定 → 投递 → 记录」整段放进同一把锁，因此不需要额外的名额预约状态 —— 预约会漏：一轮里 15 个 skip 都没有回收点。
-
-`tests/test_concurrency.py` **真的** spawn 多进程：8 个进程并发写一个文件一条不丢、12 个进程抢 5 个名额恰好 5 个、4 个进程抢同一个令牌只有 1 个成功、持有者被 `SIGKILL` 后锁立刻可用。
-
-### 无人值守
+**无人值守** —— 一个按节奏自动发现岗位并投递的后台循环：
 
 ```bash
 .venv/bin/python tools/cron_apply.py --dry-run    # 只跑护栏 + 浏览器，不投任何岗位
@@ -312,13 +330,59 @@ uv run playwright install chrome
 .venv/bin/python tools/cron_apply.py --stop
 ```
 
-先跑 `--dry-run`，并且第一次真实投递建议盯屏 —— 它和你共用同一个 Chrome profile。
+先跑 `--dry-run`，第一次真实投递建议盯屏 —— 它和你共用同一个 Chrome profile。
 
-### 隐私
+### 你的数据长什么样
 
-仓库里**不含任何人的个人信息**，一个默认名字、邮箱、电话、薪资、地址都没有 —— 全部由 `applyops-init` 问出来。`data/` 整个目录被 git 忽略，包括浏览器 profile 和里面活的会话 cookie。
+所有会变的东西都在 `data/` 下，而这个目录**整个被 git 忽略**：
 
-随仓库走的先验知识（选择器、路由种子）是**公共知识**，不是某个人的数据：它们让第一个使用者在第一次投递时就有先手，之后再靠真实命中率自我修正。
+| 路径 | 内容 | 能删吗？ |
+|---|---|---|
+| `data/profile.md` | 你的个人信息，可手改的 markdown | 不能 —— 这是你的心血 |
+| `data/memory.json` | 飞轮：学到的问答、选择器得分、历史、路由知识 | 不能 |
+| `data/guard_state.json` | 今日计数、熔断、未消费的确认令牌 | 能 |
+| `data/browser-profile/` | 活的 Chrome profile，**含会话 cookie** | 能，删了重新导入即可 |
+
+仓库本身**不含任何人的个人信息** —— 没有默认的名字、邮箱、电话、薪资、地址。请保持这样。
+
+### 为什么是这个形态
+
+这个项目的第一版自带大脑：agent 循环、可插拔 LLM provider、Web UI。把大脑搬出去后，API Key 要求、provider 漂移、整个前端一次性消失。换任何 harness 都不会失去的，恰好就是这里剩下的：浏览器层和学习型记忆。`legacy/` 是退役的 v1，作为回滚点保留。
+
+### 五条不变式
+
+代码就是围着这五条写的。破掉任何一条，都会得到一个**看起来能用**的系统。
+
+1. **飞轮记录在工具内部，不在调用方。**
+2. **提交必须持有一次性确认令牌** —— 这是拦住「误提交」的唯一真护栏。
+3. **档案空值只能问，不能猜** —— 薪资、签证状态、工作授权、法律声明，答错的代价是实害。
+4. **`selectors_suggested` 在真实跑单后必须非零** —— 它是唯一能区分「从没试过」和「试了全失败」的信号。
+5. **人工关卡必须提前声明** —— 写在路由里，在开表单之前就拿到。
+
+### 申请路由经验库：Easy Apply 才是简单的那条
+
+LinkedIn Easy Apply 不出招聘页；`amazon.jobs` 会把你交给 `passport.amazon.jobs`，那里在**第一个输入框之前**就横着一道登录，而且往往要邮箱验证码。所以知识分两层，key 都是 `<平台>/<路由>`：
+
+| 层 | 回答的问题 |
+|---|---|
+| 选择器（`platforms`） | 这个元素怎么定位 |
+| 路由（`routes`） | 几步、前提是什么、哪一步必须人来做 |
+
+`route_guide(job_url)` 在**开表单之前**返回这些，所以人工关卡（验证码、一次性密码、建账号）能和档案问题一起批量问掉，而不是填到一半才发现。路由记录还带飞轮计数 —— `blocked_at` 说「死在哪道闸门」，下一个适配器就从这句话写起。
+
+### 一次只开一个浏览器
+
+多个进程共用一个 Chrome profile，因为登录态是这个项目唯一自己造不出来的东西。两个 Chrome 挤一个 profile 不是「慢一点」，是**互相重写 cookie 数据库**。所以 profile 有独占锁，同一时刻只有一个驱动；第二个会被拒绝，返回 `browser_busy: true` 并报出持有者是谁。
+
+状态文件用锁 + 写入 —— 而且是**合并写**，即使某个写者不守规矩也不丢数据：
+
+| 文件 | 机制 | 精确度 |
+|---|---|---|
+| `guard_state.json` —— 每日上限 / 熔断 / 令牌 | 锁 + 读—改—写 | **精确**：12 个进程抢 5 个名额，结果就是 5 |
+| `memory.json` —— 飞轮 | 锁 + **合并写** | 记录一条不丢；计数器取 max |
+| `application_log.json` —— 台账 | 同一把锁，按 posting 合并 | 一条不丢、不重复 |
+
+锁用 `flock`，不用 pid 文件：内核在进程以任何方式退出时释放锁（含 `SIGKILL`），所以项目里没有陈旧锁清理，也没有任何代码需要回答「那个 pid 还活着吗」。`tests/test_concurrency.py` **真的** spawn 多进程验证以上全部。
 
 ### 许可
 
