@@ -1734,8 +1734,11 @@ class MemoryStore:
             if self._data.selectors_suggested
             else 0.0,
             "applications_total": len(self._data.application_history),
+            # Same rule as everywhere else: only a confirmed outcome is a
+            # success. `status` says the attempt happened, `outcome` says
+            # whether anyone confirmed it.
             "applications_success": sum(
-                1 for r in self._data.application_history if r.status in ("applied", "success")
+                1 for r in self._data.application_history if r.outcome == "verified"
             ),
             "vision_fallbacks": len(self._data.vision_fallbacks),
             "adapter_gaps": self.get_adapter_gaps(5),

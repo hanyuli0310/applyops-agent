@@ -50,26 +50,16 @@ from ..submission import (
 from ..submission import (
     reconcile_submission as reconcile_submission_impl,
 )
-from .runtime import BrowserBusy, Runtime, platform_for_url
+from ..evidence import (
+    detect_final_action,
+    evidence_platform,
+    success_patterns_for,
+)
+from ..platforms.naming import platform_for_url
+from .runtime import BrowserBusy, Runtime
 
 # A tool call that blocks this long is a bug, not a rate limit.
 MAX_INLINE_WAIT_SECONDS = 300.0
-
-# What a page has to say before we believe an application reached anyone.
-# Per platform because each employer writes a different sentence, and a single
-# global guess would either miss everything or accept anything. Empty means:
-# this route has no verified final action, so its result can only ever be
-# "unknown" -- which is a far better answer than "success".
-SUCCESS_EVIDENCE = {
-    "DemoATS": ("Application received",),
-    "LinkedIn": ("application was sent", "application sent", "successfully applied"),
-    "Greenhouse": ("application submitted", "thanks for applying"),
-    "Lever": ("application submitted", "thanks for applying"),
-    "Workday": ("application submitted", "thank you for applying"),
-}
-
-# The demo ATS is recognised by its own URL, never by guessing at a hostname.
-DEMO_HOSTS = ("127.0.0.1", "localhost")
 
 
 def _json(payload: Any) -> str:
@@ -922,7 +912,7 @@ def register(server: MCPServer, runtime: Runtime) -> None:
             return _json(
                 {
                     "url": browser.page.url,
-                    "platform": _evidence_platform(browser.page.url),
+                    "platform": evidence_platform(browser.page.url),
                     "fields": snapshot,
                     "unreadable": [k for k, v in snapshot.items() if v == "<unreadable>"],
                 }
@@ -956,7 +946,7 @@ def register(server: MCPServer, runtime: Runtime) -> None:
                 return _json({"granted": False, "error": f"resume problem: {exc}"})
 
             snapshot = await browser.field_snapshot()
-            platform = _evidence_platform(browser.page.url)
+            platform = evidence_platform(browser.page.url)
             request = runtime.authorizer.create_request(
                 job_key=job_id or extract_job_id(job_url) or job_url,
                 job_url=job_url,
@@ -1041,7 +1031,7 @@ def register(server: MCPServer, runtime: Runtime) -> None:
             except ResumeError as exc:
                 return _json({"submitted": False, "error": f"resume problem: {exc}"})
 
-            action, detect_detail = await _detect_final_action(
+            action, detect_detail = await detect_final_action(
                 browser, ref=final_ref, name=final_name
             )
             if action is None:
@@ -1051,7 +1041,7 @@ def register(server: MCPServer, runtime: Runtime) -> None:
             if evidence_text:
                 patterns = (evidence_text,)
             else:
-                patterns = SUCCESS_EVIDENCE.get(_evidence_platform(browser.page.url), ())
+                patterns = success_patterns_for(browser.page.url)
 
             try:
                 outcome = await execute_authorized_submission(
@@ -1116,8 +1106,8 @@ def register(server: MCPServer, runtime: Runtime) -> None:
         """
         async with runtime.lock:
             browser = await runtime.get_browser()
-            patterns = (evidence_text,) if evidence_text else SUCCESS_EVIDENCE.get(
-                _evidence_platform(browser.page.url), ()
+            patterns = (evidence_text,) if evidence_text else success_patterns_for(
+                browser.page.url
             )
             outcome = await reconcile_submission_impl(
                 controller=browser,
@@ -1128,6 +1118,49 @@ def register(server: MCPServer, runtime: Runtime) -> None:
                 evidence_timeout=8.0,
             )
             return _json(outcome.to_dict())
+
+    @server.tool()
+    async def enqueue_application(
+        job_url: str,
+        job_id: str = "",
+        route: str = "",
+        platform: str = "",
+        title: str = "",
+        company: str = "",
+    ) -> str:
+        """Accept a posting into the durable application queue.
+
+        Idempotent per job id: the same posting reached twice is one application,
+        not two. Nothing happens to it until `preflight` -> the M1 flow runs.
+        """
+        row = runtime.service.enqueue(
+            job_url=job_url,
+            job_id=job_id or extract_job_id(job_url),
+            route=route,
+            platform=platform or platform_for_url(job_url),
+            title=title,
+            company=company,
+        )
+        return _json({"enqueued": True, "application": row.to_dict()})
+
+    @server.tool()
+    async def application_status(application_id: str) -> str:
+        """One application's state, attempts and full event history."""
+        try:
+            return _json(runtime.service.status(application_id))
+        except KeyError as exc:
+            return _json({"error": str(exc)})
+
+    @server.tool()
+    async def list_applications(state: str = "") -> str:
+        """Queued and past applications, optionally filtered by state.
+
+        States: queued, preparing, waiting_for_input, waiting_for_approval,
+        submitting, submitted_verified, submitted_unverified, failed,
+        cancelled, skipped, legacy_imported.
+        """
+        rows = runtime.service.list(state or None)
+        return _json({"count": len(rows), "applications": [r.to_dict() for r in rows]})
 
     @server.tool()
     async def browser_close() -> str:
@@ -1147,19 +1180,8 @@ def _example_profile_path():
 #
 # Kept below `register` so they read as implementation detail rather than as
 # surface: nothing here becomes a tool, and a tool must never be able to reach
-# around the authorization path these helpers feed.
-
-
-def _evidence_platform(url: str) -> str:
-    """Which success vocabulary applies to this page.
-
-    The demo ATS gets its own label so that local safety tests can be verified
-    without pretending the employer side said anything.
-    """
-    lowered = (url or "").lower()
-    if any(host in lowered for host in DEMO_HOSTS):
-        return "DemoATS"
-    return platform_for_url(url)
+# around the authorization path these helpers feed. Platform naming and final
+# action detection live in `evidence.py`, shared with the service and the UI.
 
 
 def _current_resume(runtime: Runtime) -> ResumeRef:
@@ -1207,60 +1229,6 @@ def _profile_revision(runtime: Runtime) -> str:
     except OSError:
         return "unreadable"
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-
-
-async def _detect_final_action(
-    browser: BrowserController, *, ref: str = "", name: str = ""
-) -> tuple[FinalAction | None, str]:
-    """Find the control that genuinely ends this application.
-
-    Detection rather than trust: the caller does not get to nominate any button
-    it likes, because nominating "Submit" is how a partial form gets sent. When a
-    candidate is supplied it still has to classify as a final submit; otherwise
-    the page itself is scanned and an ambiguous result is reported, never guessed
-    between.
-    """
-    candidates: list[tuple[str, str]] = []  # (ref, name)
-
-    if ref or name:
-        facts, error = await browser.inspect_target(ref=ref, name=name)
-        if facts is None:
-            return None, error
-        if decide_click(facts, authorized=True).target_class is ClickClass.FINAL_SUBMIT:
-            candidates.append((ref, name))
-        else:
-            return None, (
-                f"{facts.label!r} is not a final submit control "
-                f"(classified {decide_click(facts, authorized=True).target_class.value})"
-            )
-    else:
-        state = await browser.get_page_state()
-        for button in state.buttons:
-            facts, _ = await browser.inspect_target(name=button.name)
-            if facts is None:
-                continue
-            if (
-                decide_click(facts, authorized=True).target_class
-                is ClickClass.FINAL_SUBMIT
-            ):
-                candidates.append((facts.ref, button.name))
-
-    if not candidates:
-        return None, (
-            "no final submit control found on this page. Either the form is not "
-            "at its last step, or this route's final action is unknown -- in "
-            "which case the application must be finished by hand."
-        )
-    if len(candidates) > 1:
-        return None, (
-            "more than one final submit control found "
-            f"({', '.join(n for _, n in candidates)}); refusing to guess which "
-            "one ends the application. Pass final_ref explicitly."
-        )
-
-    found_ref, found_name = candidates[0]
-    patterns = SUCCESS_EVIDENCE.get(_evidence_platform(browser.page.url), ())
-    return FinalAction(ref=found_ref, name=found_name, success_patterns=patterns), ""
 
 
 def _record_application(

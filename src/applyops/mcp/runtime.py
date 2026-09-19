@@ -41,7 +41,10 @@ from .. import concurrency
 from ..authorization import SubmissionAuthorizer
 from ..browser import BrowserController
 from ..guardrails import Guardrails
+from ..ledger import Ledger
+from ..service import ApplicationService
 from ..memory import MemoryStore
+from ..platforms.naming import platform_for_url  # noqa: F401 - re-exported
 
 # Where this machine's state lives. Overridable so tests (and later a packaged
 # install) can point at a directory the user chose, rather than at whatever the
@@ -55,39 +58,6 @@ def default_data_dir() -> Path:
     if override:
         return Path(override).expanduser()
     return Path(__file__).parent.parent.parent.parent / "data"
-
-# Domain -> platform label. Kept here rather than in `platforms/detector.py`
-# because this is about *naming the flywheel bucket*, not about deciding how to
-# drive a site; the richer detector stays available for the M3 adapters.
-#
-# The labels must agree with `Platform`'s values for any platform that has an
-# apply route on record: a route is keyed `<platform>/<route>`, so naming the
-# same site "Amazon" in one layer and "Unknown" in the other would file the same
-# lesson under two keys and make both look unlearned.
-_PLATFORM_BY_DOMAIN = (
-    ("linkedin.com", "LinkedIn"),
-    ("indeed.com", "Indeed"),
-    ("amazon.jobs", "Amazon"),
-    ("greenhouse.io", "Greenhouse"),
-    ("lever.co", "Lever"),
-    ("myworkdayjobs.com", "Workday"),
-    ("workday.com", "Workday"),
-    ("ashbyhq.com", "Ashby"),
-    ("smartrecruiters.com", "SmartRecruiters"),
-    ("icims.com", "iCIMS"),
-    ("workable.com", "Workable"),
-    ("bamboohr.com", "BambooHR"),
-)
-
-
-def platform_for_url(url: str) -> str:
-    """Best-effort platform label for a URL, used to bucket flywheel knowledge."""
-    lowered = (url or "").lower()
-    for domain, label in _PLATFORM_BY_DOMAIN:
-        if domain in lowered:
-            return label
-    return "Unknown"
-
 
 class BrowserBusy(RuntimeError):
     """Another process is driving the shared Chrome profile, so this refuses.
@@ -123,6 +93,9 @@ class Runtime:
         # step and the code that wants permission are necessarily not the same
         # actor even though they may be the same machine.
         self.authorizer = SubmissionAuthorizer(self.data_dir)
+        # The unified application core, built lazily: importing this module
+        # must not create app.sqlite in anyone's data directory.
+        self._service: ApplicationService | None = None
         self._browser: Optional[BrowserController] = None
         self._lock = asyncio.Lock()
         # Guards `data/browser-profile` against every other process on this
@@ -161,6 +134,20 @@ class Runtime:
             return
         if not self._profile_lock.acquire():
             raise BrowserBusy(self.profile_holder())
+
+    @property
+    def service(self) -> ApplicationService:
+        """The unified application core: one ledger, one lifecycle, shared by
+        every entry point in this process. M3's UI and M4's runner talk to
+        this, not to their own copies of the semantics."""
+        if self._service is None:
+            self._service = ApplicationService(
+                self.data_dir,
+                memory=self.memory,
+                authorizer=self.authorizer,
+                ledger=Ledger(self.data_dir / "app.sqlite"),
+            )
+        return self._service
 
     async def get_browser(self) -> BrowserController:
         """Launch the browser on first use, then reuse it.

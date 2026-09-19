@@ -111,3 +111,75 @@ fix was put back. The screenshot repro that started this investigation
 application state machine (`QUEUED … SUBMITTED_VERIFIED / SUBMITTED_UNVERIFIED /
 FAILED / CANCELLED`), invalid-transition rejection, crash recovery tests, and
 migration with backup/rollback.
+
+---
+
+## M2 — Unified Core
+
+**Status: COMPLETE. All tests pass. No real submissions.**
+
+- Starting commit: `ce0a5da` (M1)
+- Branch: `feat/applyops-v02` (local only; not pushed)
+
+### What changed, and why
+
+| change | file(s) | why |
+|---|---|---|
+| Explicit application state machine | new `src/applyops/state_machine.py` | states were free-form strings; nothing refused an impossible move |
+| Durable SQLite ledger: applications, attempts, append-only events | new `src/applyops/ledger.py` (WAL, `PRAGMA user_version`) | two entry points could not share state; JSON merge cannot do compare-and-set |
+| Claims with expiry | `ledger.py` | two entry points must not execute one application; a crashed claim expires instead of wedging the row |
+| Crash recovery | `ledger.recover_expired()` | a process dying inside `SUBMITTING` lands in `SUBMITTED_UNVERIFIED` — never back at "ready to submit again" |
+| Unified `ApplicationService` | new `src/applyops/service.py` | one lifecycle for MCP, batch runner and (later) the UI, instead of three |
+| Attempt rows | `ledger.py` | a retry appends; it never overwrites the failed attempt |
+| Legacy migration with backup | `service.import_legacy_history()` | old `memory.json` history -> `LEGACY_IMPORTED` (terminal), idempotent, source backed up first |
+| Schema downgrade refused | `ledger.migrate()` | newer data must not be silently mangled by older code |
+| MCP queue surface | `runtime.py` (lazy `service`), `tools.py` (`enqueue_application`, `application_status`, `list_applications`) | M3/M4 talk to the core instead of reimplementing semantics |
+| Platform naming extracted | new `src/applyops/platforms/naming.py`, shared `src/applyops/evidence.py` | final-action detection + success vocabulary must be identical for every driver |
+
+### State machine (enforced, not documented)
+
+`QUEUED -> PREPARING -> WAITING_FOR_INPUT | WAITING_FOR_APPROVAL -> SUBMITTING ->
+SUBMITTED_VERIFIED | SUBMITTED_UNVERIFIED | FAILED`; `FAILED -> PREPARING` (retry
+= new attempt); `SUBMITTED_UNVERIFIED -> SUBMITTED_VERIFIED` (reconciliation
+evidence only); `SUBMITTED_UNVERIFIED -/-> SUBMITTING` (no resubmission, by
+construction); `LEGACY_IMPORTED` terminal.
+
+### Schema
+
+`applications` (state, claim_owner, claim_expires_at, …, UNIQUE job_key),
+`attempts` (UNIQUE (application_id, ordinal)), `events` (append-only),
+`PRAGMA user_version = 1`. New file `app.sqlite` in the data root; created lazily
+on first use, nothing existing is migrated or rewritten.
+
+### Tests executed
+
+```bash
+.venv/bin/python -m pytest tests/ -q        # 85 passed in 94.9s (62 pre-M2 + 23 M2)
+.venv/bin/ruff check src tools tests        # no new errors; new modules lint-clean
+```
+
+Covered: illegal transitions (incl. `SUBMITTING -> WAITING_FOR_APPROVAL` and
+`SUBMITTED_UNVERIFIED -> SUBMITTING`), restart durability, idempotent enqueue,
+stale-writer rejection, 2-thread claim race (exactly one winner), attempt
+accumulation, unknown outcome refused, expired-claim recovery, schema-downgrade
+refusal, legacy import (never verified / idempotent / backup / failure keeps
+source untouched), service E2E on the demo ATS (prepare -> input -> approval ->
+submit -> verified), wrong-state submit writes no attempt, flywheel mirror counts
+only verified.
+
+### Known limitations
+
+1. Cross-process double-execution is prevented by claims + optimistic
+   transitions; a hostile process that bypasses the ledger entirely is out of
+   scope (same-OS-user boundary, as in M1).
+2. `service.prepare(ready=...)` trusts its caller for readiness; the UI/runner
+   wiring in M3/M4 must derive it from actual snapshot/profile checks.
+3. Migration imports only rows with a usable `job_id`/`job_url`; rows without
+   either are counted as `skipped` and left in the source file.
+4. The scheduled runner (`cron_apply.py`) still drives the old flow; it moves to
+   the service in M4.
+
+### Next milestone
+
+**M3 — Local Web UI**: FastAPI service backend over `ApplicationService`,
+React/TypeScript/Vite frontend, four pages, real API only (no mock data).
