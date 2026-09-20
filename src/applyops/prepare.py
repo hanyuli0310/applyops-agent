@@ -25,10 +25,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .apply_target import form_control_count, offsite_apply_host
 from .browser import BrowserController
 from .company_policy import CompanyDecision, CompanyPolicyStore
 from .filling import fill_application_form, resume_for_fill
-from .platforms.naming import is_drivable_route
+from .platforms.naming import EXTERNAL_ROUTE, is_drivable_route
 from .resume import ResumeError, ResumeRef, resolve_resume
 from .service import ApplicationService
 from .state_machine import ApplicationState
@@ -143,7 +144,62 @@ async def prepare_application(
                 detail=str(exc),
             )
 
-    await controller.goto(row.job_url, settle=1.0)
+    # Keep an already-open Easy Apply modal. LinkedIn renders the modal in
+    # place while keeping the posting URL unchanged; navigating to the same
+    # URL here silently closes it and leaves the filler staring at the posting
+    # page with no file input. Only navigate when the active page is a
+    # different posting.
+    current_url = (controller.page.url or "").rstrip("/")
+    target_url = (row.job_url or "").rstrip("/")
+    if current_url != target_url:
+        await controller.goto(row.job_url, settle=1.0)
+
+    # The page, not the discovery URL, decides where the application happens.
+    # A LinkedIn posting whose Apply control leaves for Greenhouse is filed as
+    # `easy_apply` by `resolve_route`; here is where that gets corrected, before
+    # anything is filled and before any request is filed on the wrong basis.
+    offsite_host = await offsite_apply_host(controller)
+    if offsite_host:
+        service.set_route(application_id, EXTERNAL_ROUTE)
+        detail = (
+            f"the application form is not on this page: its Apply control leaves for "
+            f"{offsite_host}, and this project has no verified submission path there. "
+            "Open the posting and finish it on that site, or skip the posting."
+        )
+        missing = [f"off-site application on {offsite_host}"]
+        service.prepare(
+            application_id,
+            ready=False,
+            detail=detail,
+            payload={"off_site_host": offsite_host, "missing": missing},
+        )
+        return PrepareOutcome(
+            state=ApplicationState.WAITING_FOR_INPUT.value,
+            route=EXTERNAL_ROUTE,
+            missing=missing,
+            detail=detail,
+        )
+
+    if await form_control_count(controller) == 0:
+        # Not the form at all. Said plainly, because what the filler reports for a
+        # page with nothing on it ("no file input found on this form") sends the
+        # reader looking for a resume upload on a posting that has no form.
+        detail = (
+            "there is no application form on this page, so there is nothing to fill "
+            "and nothing that could be submitted from here."
+        )
+        service.prepare(
+            application_id,
+            ready=False,
+            detail=detail,
+            payload={"missing": ["no application form on this page"]},
+        )
+        return PrepareOutcome(
+            state=ApplicationState.WAITING_FOR_INPUT.value,
+            route=route,
+            missing=["no application form on this page"],
+            detail=detail,
+        )
 
     report = await fill_application_form(
         controller,

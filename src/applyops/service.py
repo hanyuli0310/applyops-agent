@@ -378,6 +378,10 @@ class ApplicationService:
         finally:
             self.ledger.release_claim(application_id, self.owner)
 
+    def set_route(self, application_id: str, route: str) -> None:
+        """Record the route the page actually implies (see `applyops.apply_target`)."""
+        self.ledger.set_route(application_id, route)
+
     async def reconcile(
         self,
         application_id: str,

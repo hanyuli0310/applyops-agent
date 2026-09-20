@@ -14,8 +14,11 @@ one. See the notes on ``fill_field`` and ``select_option``.
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from playwright.async_api import BrowserContext, Locator, Page, async_playwright
@@ -198,50 +201,143 @@ class PageState(BaseModel):
 # ── Controller ───────────────────────────────────────────────────────
 
 
+#: The DevTools port the project's own attach helper uses (`tools/attach.py`).
+#: A browser launched that way is detached on purpose, so it outlives whatever
+#: started it -- which is exactly how a profile ends up with a live Chrome and a
+#: free lock file.
+DEFAULT_DEBUG_PORT = 9222
+
+_ALREADY_IN_USE = "already in use"
+
+
 class BrowserController:
-    """Drives a headful Chrome with a persistent profile."""
+    """Drives a headful Chrome with a persistent profile.
+
+    Two ways to end up with a browser, and the difference matters:
+
+    - **launch** -- we start it, we own it, `close()` shuts it down.
+    - **attach** -- one is already up on the project's debugging port (started by
+      `tools/attach.py`, or left behind by a run that died). We connect to it and
+      leave it running on the way out, because it is not ours to kill. Without
+      this, a single abandoned Chrome made every later run fail with Chromium's
+      "profile is already in use" while the lock file said the way was clear.
+    """
 
     def __init__(
         self,
         headless: bool = False,
         user_data_dir: str | Path | None = None,
         channel: str = CHROME_CHANNEL,
+        debug_port: int = DEFAULT_DEBUG_PORT,
     ):
         self.headless = headless
         self.channel = channel
+        self.debug_port = debug_port
         self._playwright = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        self._attached = False
         self._user_data_dir = Path(
             user_data_dir or Path(__file__).parent.parent.parent / "data" / "browser-profile"
         )
 
     # ── lifecycle ────────────────────────────────────────────────────
 
+    @staticmethod
+    def endpoint_up(port: int, timeout: float = 1.0) -> bool:
+        """True when a Chrome DevTools endpoint answers on this port."""
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/version", timeout=timeout
+            ) as response:
+                return json.loads(response.read()).get("Browser", "").startswith("Chrome")
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
+
     async def launch(self):
+        """Attach to the project's browser if one is up, otherwise start one."""
         self._user_data_dir.mkdir(parents=True, exist_ok=True)
         self._playwright = await async_playwright().start()
-        self._context = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self._user_data_dir),
-            channel=self.channel,
-            headless=self.headless,
-            viewport={"width": 1400, "height": 950},
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
-        )
+
+        if await asyncio.to_thread(self.endpoint_up, self.debug_port):
+            await self._attach()
+            return
+
+        try:
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=str(self._user_data_dir),
+                channel=self.channel,
+                headless=self.headless,
+                viewport={"width": 1400, "height": 950},
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    f"--remote-debugging-port={self.debug_port}",
+                    # Mirrors the attach helper: without the mock keychain pair
+                    # Chrome cannot decrypt this profile's cookies and deletes
+                    # them, which logs the user out of everything.
+                    "--password-store=basic",
+                    "--use-mock-keychain",
+                ],
+            )
+        except Exception as exc:
+            await self._stop_playwright()
+            if _ALREADY_IN_USE in str(exc) or "existing browser session" in str(exc):
+                raise RuntimeError(self._busy_message()) from exc
+            raise
+        self._attached = False
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
 
+    async def _attach(self) -> None:
+        """Connect to the browser that is already on this profile."""
+        self._context = await self._playwright.chromium.connect_over_cdp(
+            f"http://127.0.0.1:{self.debug_port}"
+        )
+        self._attached = True
+        contexts = self._context.contexts
+        if not contexts:
+            raise RuntimeError(
+                "attached to the browser but it has no browsing context; close it and retry"
+            )
+        self._context = contexts[0]
+        self._page = (
+            self._context.pages[0] if self._context.pages else await self._context.new_page()
+        )
+
+    async def _stop_playwright(self) -> None:
+        if self._playwright is not None:
+            try:
+                await self._playwright.stop()
+            except Exception:  # noqa: BLE001, S110 - teardown must not mask the cause
+                pass
+            self._playwright = None
+
+    def _busy_message(self) -> str:
+        return (
+            f"the profile {self._user_data_dir} is already open in another Chrome, and "
+            f"nothing is answering on the debugging port {self.debug_port}, so it cannot "
+            "be driven. Close that Chrome window (or kill the process whose "
+            f"--user-data-dir={self._user_data_dir}), then retry. `applyops stop` does "
+            "this for you."
+        )
+
+    @property
+    def attached(self) -> bool:
+        """True when we connected to a browser we did not start."""
+        return self._attached
+
     async def close(self):
-        if self._context:
+        """Disconnect, and shut the browser down only if we started it."""
+        # Only close a browser we started. An attached one belongs to whoever
+        # launched it (the attach helper, or an earlier run) and may be showing
+        # the user's windows; stopping Playwright drops our connection to it.
+        if self._context is not None and not self._attached:
             await self._context.close()
-        if self._playwright:
-            await self._playwright.stop()
+        await self._stop_playwright()
         self._page = None
         self._context = None
-        self._playwright = None
+        self._attached = False
 
     @property
     def launched(self) -> bool:
@@ -277,7 +373,10 @@ class BrowserController:
         tabs = []
         for index, page in enumerate(self.context.pages):
             try:
-                title = await page.title()
+                # A popup or a page mid-navigation can leave the title request
+                # waiting on CDP indefinitely. Tab inventory is diagnostic and
+                # must not block the application form itself.
+                title = await asyncio.wait_for(page.title(), timeout=1.5)
             except Exception:
                 title = ""
             tabs.append(
@@ -375,13 +474,18 @@ class BrowserController:
         seen: set[str] = set()
 
         for frame in [self.page.main_frame, *[f for f in self.page.frames if f is not self.page.main_frame]]:
+            # Detached/blank extension frames are common on LinkedIn and can
+            # leave a locator query waiting forever over CDP. They cannot hold
+            # a visible application control, so skip them before querying.
+            if frame is not self.page.main_frame and not (frame.url or "").strip():
+                continue
             try:
                 candidates = frame.locator(
                     'button, a[role="button"], input[type="submit"], input[type="button"], '
                     '[role="dialog"] a, dialog a, a[aria-label], '
                     'a[href*="openSDUIApplyFlow"]'
                 )
-                count = await candidates.count()
+                count = await asyncio.wait_for(candidates.count(), timeout=2.0)
             except Exception:
                 continue
 

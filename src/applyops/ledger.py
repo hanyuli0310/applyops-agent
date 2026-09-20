@@ -359,6 +359,21 @@ class Ledger:
 
     # ── attempts ─────────────────────────────────────────────────────
 
+    def set_route(self, application_id: str, route: str) -> None:
+        """Correct the route once the page has told us what it really is.
+
+        The route is first guessed from the URL the posting was discovered at,
+        which for LinkedIn is always its own job page -- so a posting that leaves
+        for another ATS arrives mislabelled. Recording the correction is what
+        stops the queue from treating it as drivable for the rest of its life.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE applications SET route = ?, updated_at = ? WHERE id = ?",
+                (route, _now(), application_id),
+            )
+            self._conn.commit()
+
     def start_attempt(self, application_id: str) -> AttemptRow:
         with self._lock, self._conn:
             count = self._conn.execute(

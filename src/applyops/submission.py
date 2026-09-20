@@ -122,6 +122,17 @@ async def execute_authorized_submission(
     evidence_timeout: float = DEFAULT_EVIDENCE_TIMEOUT,
 ) -> SubmitOutcome:
     """Perform one final submit, or refuse. Authorization first, evidence after."""
+    if not await controller.field_snapshot():
+        # Checked before the grant is spent and before anything is looked up:
+        # there is no form here, so there is nothing a click could submit. The
+        # digest cannot catch this -- an empty form has an empty digest, and an
+        # empty digest matches itself.
+        raise SubmissionRefused(
+            "there is no application form on this page, so nothing was sent and "
+            "nothing could be: the application is not here. Check that the posting "
+            "is one this project can drive before requesting approval again."
+        )
+
     facts, inspect_error = await controller.inspect_target(ref=action.ref, name=action.name)
     if facts is None:
         raise SubmissionRefused(f"cannot identify the final action: {inspect_error}")

@@ -32,7 +32,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Self
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 CONFIRMED_TEXT = "Application received"
 FAILED_TEXT = "There was a problem with your submission"
@@ -184,6 +184,27 @@ def validate_choices(fields: dict[str, str], files: dict[str, str]) -> list[str]
     return problems
 
 
+def _offsite_posting(ats_host: str) -> str:
+    """A posting that is NOT Easy Apply: the apply control leaves for another site.
+
+    Shaped after the real thing, down to the redirect wrapper LinkedIn uses --
+    `<a href="https://www.linkedin.com/safety/go/?url=<encoded ATS url>">Apply</a>`
+    -- because that wrapper is the only signal on the page that says "the
+    application is not here".
+    """
+    target = "https://boards.greenhouse.io/acme/jobs/7742875"
+    wrapped = f"https://www.linkedin.com/safety/go/?url={quote(target, safe='')}"
+    return _page(
+        "Backend Engineer — Acme",
+        "<div class='banner'>Local demo posting. The application lives on another "
+        "site, exactly like a non-Easy-Apply LinkedIn posting.</div>"
+        "<h1>Backend Engineer</h1>"
+        "<p>Acme · Remote (US)</p>"
+        f"<a href='{wrapped}'>Apply</a>"
+        "<p>No application form on this page.</p>",
+    )
+
+
 def _form(scenario: str) -> str:
     """One application form, with variations selected by `scenario`.
 
@@ -306,6 +327,9 @@ class DemoATS:
                     return
                 if parsed.path == "/choices":
                     self._write(200, _choices_form())
+                    return
+                if parsed.path == "/offsite":
+                    self._write(200, _offsite_posting(self.headers.get("Host", "")))
                     return
                 if parsed.path == "/-/last-submission":
                     payload = json.dumps(outer.last_submission, ensure_ascii=False).encode(
