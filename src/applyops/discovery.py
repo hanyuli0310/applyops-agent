@@ -42,6 +42,11 @@ JOB_VIEW_TEMPLATE = "https://www.linkedin.com/jobs/view/{job_id}/"
 # `f_AL` is LinkedIn's "Easy Apply" facet. `sortBy=DD` is newest-first, which
 # matters because a stale posting is often already filled.
 FACET_EASY_APPLY = "f_AL"
+#: LinkedIn's experience-level facet. Asking the site to filter is more honest
+#: than guessing from a title: `f_E=2` is "Entry level", and the applicant this
+#: installation serves is a recent graduate (AGENTS.md §12).
+FACET_EXPERIENCE_LEVEL = "f_E"
+FACET_ENTRY_LEVEL = "2"
 SORT_NEWEST = "DD"
 
 # Scroll-and-re-read passes. The list unloads cards that leave the viewport, so
@@ -120,6 +125,7 @@ def build_search_url(
     easy_apply_only: bool = True,
     recent_days: int = 0,
     start: int = 0,
+    entry_level_only: bool = False,
 ) -> str:
     """Compose a jobs search URL.
 
@@ -135,6 +141,13 @@ def build_search_url(
     if recent_days:
         # `f_TPR` is a relative time window in seconds: r604800 = past 7 days.
         params["f_TPR"] = f"r{int(recent_days) * 86400}"
+    if entry_level_only:
+        # `f_E` is LinkedIn's own experience-level facet (1 Internship,
+        # 2 Entry level, 3 Associate, 4 Mid-Senior, 5 Director, 6 Executive).
+        # Asking the site to filter beats guessing from the title: the title
+        # pattern in `target_titles.is_entry_level` stays as a second net for
+        # postings the facet lets through and for everything not searched here.
+        params[FACET_EXPERIENCE_LEVEL] = FACET_ENTRY_LEVEL
     if start:
         params["start"] = str(start)
     return f"{SEARCH_ENDPOINT}?{urlencode(params)}"
@@ -333,6 +346,7 @@ async def search(
     easy_apply_only: bool = True,
     recent_days: int = 0,
     passes: int = DEFAULT_PASSES,
+    entry_level_only: bool = False,
 ) -> SearchResult:
     """Run a search and return the postings found.
 
@@ -340,7 +354,9 @@ async def search(
     leave the viewport -- a single read would silently return only whatever
     happened to be on screen.
     """
-    url = build_search_url(keywords, location, easy_apply_only, recent_days)
+    url = build_search_url(
+        keywords, location, easy_apply_only, recent_days, entry_level_only=entry_level_only
+    )
     result = SearchResult(search_url=url)
 
     try:
