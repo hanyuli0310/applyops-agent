@@ -458,6 +458,29 @@ def _clean(value: str) -> str:
     return _COMMENT.sub("", value).strip()
 
 
+def _split_name(full: str) -> tuple[str, str]:
+    """Given name and family name, from the one full name we store.
+
+    The last token is the family name and everything before it is the given
+    name: the usual convention, and the only split that is mechanical rather
+    than a guess about which word is which. A single-token name has no family
+    name to report and says so, instead of duplicating itself into both fields.
+    """
+    parts = [part for part in (full or "").split() if part]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return " ".join(parts[:-1]), parts[-1]
+
+
+#: Keys answered from another stored value instead of being stored twice.
+_DERIVED_KEYS: dict[str, object] = {
+    "first_name": lambda values: _split_name(values.get("name", ""))[0],
+    "last_name": lambda values: _split_name(values.get("name", ""))[1],
+}
+
+
 class ProfileStore:
     """Loads, validates and persists `profile.md`."""
 
@@ -483,11 +506,38 @@ class ProfileStore:
     # ── reads ────────────────────────────────────────────────────────
 
     def get(self) -> dict[str, str]:
-        """Every stored value, including custom keys."""
-        return {k: v for k, v in self._values.items() if v}
+        """Every stored value, including custom keys -- plus the derived ones.
+
+        Derived keys are included here rather than only in `value()` because this
+        is what the rest of the system reads (`MemoryStore.get_profile`, the
+        filler, the console). A form that asks for `First name` and `Last name`
+        separately is asking about the one `name` we store; answering it in one
+        place is what stops each caller inventing its own split.
+        """
+        values = {k: v for k, v in self._values.items() if v}
+        for key, derive in _DERIVED_KEYS.items():
+            if values.get(key):
+                continue
+            derived = derive(self._values)
+            if derived:
+                values[key] = derived
+        return values
 
     def value(self, key: str, default: str = "") -> str:
-        return self._values.get(key, default)
+        """One stored value -- or one derived from a stored value.
+
+        A real Easy Apply modal asks for `First name` and `Last name` as separate
+        required fields while the profile stores a single `name`; without a split
+        the filler has nothing to write *and nothing to check the site's own
+        pre-fill against*, so it reported both as missing on a live run.
+        """
+        stored = self._values.get(key)
+        if stored:
+            return stored
+        derive = _DERIVED_KEYS.get(key)
+        if derive is not None:
+            return derive(self._values)
+        return default
 
     def unknown_keys(self) -> list[str]:
         return [k for k in self._values if k not in FIELDS_BY_KEY]

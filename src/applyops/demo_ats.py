@@ -210,6 +210,22 @@ def _offsite_posting(ats_host: str, local_target: str = "") -> str:
     )
 
 
+def _onsite_posting() -> str:
+    """A posting whose Easy Apply control is a link to this site's own apply page.
+
+    This is what a real LinkedIn Easy Apply posting looks like: the form is not
+    on the posting page, and the control is a same-host link (`/apply`), not a
+    modal and not a redirect off-site.
+    """
+    return _page(
+        "Easy Apply — Demo ATS",
+        "<div class='banner'>Local demo posting. The application form is one click "
+        "away, on this same site.</div>"
+        "<h1>Backend Engineer</h1><p>Ordinary Co · Remote (US)</p>"
+        "<a href='/apply'>Easy Apply</a>",
+    )
+
+
 def _form(scenario: str) -> str:
     """One application form, with variations selected by `scenario`.
 
@@ -341,6 +357,29 @@ class DemoATS:
                         self.end_headers()
                         return
                     self._write(400, _page("Bad redirect", "<p>missing url</p>"))
+                    return
+
+                if parsed.path == "/onsite":
+                    self._write(200, _onsite_posting())
+                    return
+                if parsed.path == "/apply":
+                    # The Easy Apply page: the same form at its own URL, plus the
+                    # split first/last name fields a real LinkedIn modal asks for
+                    # (and pre-fills from the member's own profile).
+                    form = _form("standard").replace(
+                        "action='/submit?scenario=standard'", "action='/submit'"
+                    )
+                    form = form.replace(
+                        "<label for='name'>Full name</label>"
+                        "<input id='name' name='name' type='text' required>",
+                        "<label for='first_name'>First name</label>"
+                        "<input id='first_name' name='first_name' type='text' value='Jane' required>"
+                        "<label for='last_name'>Last name</label>"
+                        "<input id='last_name' name='last_name' type='text' value='Doe' required>"
+                        "<label for='city'>Location (city)</label>"
+                        "<input id='city' name='city' type='text' required>",
+                    )
+                    self._write(200, form)
                     return
 
                 if parsed.path == "/offsite":

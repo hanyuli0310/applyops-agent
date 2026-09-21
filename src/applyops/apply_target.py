@@ -19,7 +19,7 @@ application, or point somewhere else that does?
 from __future__ import annotations
 
 import asyncio
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from .browser import BrowserController
 
@@ -158,3 +158,77 @@ async def _element_for(controller: BrowserController, label: str, href: str):
         if element is not None:
             return element
     return await find_button(controller.page, label)
+
+
+async def open_onsite_application(controller: BrowserController) -> tuple[str, str]:
+    """Follow a *same-site* apply control to the form it opens.
+
+    The other half of the same problem. A real LinkedIn Easy Apply posting puts
+    the form one click away (`<a href="/jobs/view/<id>/apply/">Easy Apply</a>`)
+    on its own host -- no redirect, no modal, and nothing on the posting page for
+    the filler to see. Preparing without following it parks the application under
+    "no file input found on this form", which is what happened on a live run.
+
+    Only ever called when the page in front of us has no form, so there is
+    nothing a click could submit; and a control whose name reads like a final
+    submit is skipped regardless, which is the belt to that structural braces.
+    """
+    from .action_policy import looks_final_by_name
+
+    current_host = host_of(controller.page.url)
+    controls = await controller.page.evaluate(_COLLECT_APPLY_JS)
+    for control in controls or []:
+        label = str(control.get("text", ""))
+        if not _looks_like_apply(label) or looks_final_by_name(label):
+            continue
+        href = str(control.get("href") or "")
+        # Relative hrefs (`/apply`) are the common case here and carry no host of
+        # their own: resolving them against the current page is what stops a
+        # same-site link being mistaken for the off-site case and skipped.
+        destination = urljoin(controller.page.url, unwrap(href)) if href else ""
+        if destination and host_of(destination) != current_host:
+            continue  # that is the off-site case, handled by follow_offsite_apply
+        if href and destination:
+            # Navigate rather than click. Verified live: LinkedIn's "Easy Apply"
+            # is an `<a href=".../apply/?openSDUIApplyFlow=true">` whose scripted
+            # click does nothing at all -- no navigation, no new tab, no modal --
+            # while going to the href it names opens the application straight
+            # away. An href is a destination; using it is both more reliable and
+            # less like poking at a live page.
+            try:
+                await controller.goto(destination, settle=2.5)
+            except Exception:  # noqa: BLE001, S112 - an unreachable target is data
+                continue
+            return controller.page.url, label
+
+        element = await _element_for(controller, label, href)
+        if element is None:
+            continue
+        try:
+            await element.click(timeout=15000, no_wait_after=True)
+        except Exception:  # noqa: BLE001, S112 - an unclickable control is not a crash
+            continue
+        await asyncio.sleep(1.2)
+        return controller.page.url, label
+    return "", ""
+
+
+async def has_apply_control(controller: BrowserController) -> bool:
+    """Whether the page offers a control whose job is to open the application.
+
+    The count of controls on a page is not the question: a real LinkedIn posting
+    has three (its own search boxes) and no form. This asks the specific
+    question -- is there something here that opens an application, and is it not
+    a submit button in disguise.
+    """
+    from .action_policy import looks_final_by_name
+
+    try:
+        controls = await controller.page.evaluate(_COLLECT_APPLY_JS)
+    except Exception:  # noqa: BLE001 - an unreadable page offers nothing
+        return False
+    return any(
+        _looks_like_apply(str(c.get("text", "")))
+        and not looks_final_by_name(str(c.get("text", "")))
+        for c in controls or []
+    )

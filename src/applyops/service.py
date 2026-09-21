@@ -123,6 +123,7 @@ class ApplicationService:
         platform: str = "",
         title: str = "",
         company: str = "",
+        location: str = "",
     ) -> ApplicationRow:
         """Accept a posting into the queue. Idempotent per job key."""
         return self.ledger.create_application(
@@ -132,6 +133,7 @@ class ApplicationService:
             platform=platform,
             title=title,
             company=company,
+            location=location,
         )
 
     def get(self, application_id: str) -> ApplicationRow | None:

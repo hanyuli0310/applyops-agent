@@ -25,7 +25,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .apply_target import follow_offsite_apply, form_control_count, host_of, offsite_apply_host
+from .apply_target import (
+    follow_offsite_apply,
+    form_control_count,
+    has_apply_control,
+    host_of,
+    offsite_apply_host,
+    open_onsite_application,
+)
 from .browser import BrowserController
 from .company_policy import CompanyDecision, CompanyPolicyStore
 from .filling import fill_application_form, resume_for_fill
@@ -194,27 +201,6 @@ async def prepare_application(
             detail=detail,
         )
 
-    if await form_control_count(controller) == 0:
-        # Not the form at all. Said plainly, because what the filler reports for a
-        # page with nothing on it ("no file input found on this form") sends the
-        # reader looking for a resume upload on a posting that has no form.
-        detail = (
-            "there is no application form on this page, so there is nothing to fill "
-            "and nothing that could be submitted from here."
-        )
-        service.prepare(
-            application_id,
-            ready=False,
-            detail=detail,
-            payload={"missing": ["no application form on this page"]},
-        )
-        return PrepareOutcome(
-            state=ApplicationState.WAITING_FOR_INPUT.value,
-            route=route,
-            missing=["no application form on this page"],
-            detail=detail,
-        )
-
     return await _fill_and_file(
         service,
         controller,
@@ -250,7 +236,38 @@ async def _fill_and_file(
         resume=resume,
         application_id=application_id,
         company=row.company,
+        job_location=row.location,
     )
+
+    if not report.filled and await has_apply_control(controller):
+        # Nothing here was fillable, and the page offers a control that opens the
+        # application: the form is behind it. A real LinkedIn Easy Apply posting
+        # looks exactly like this -- its own search boxes, the form one click
+        # away at `/jobs/view/<id>/apply/` -- which is why "does this page have
+        # controls" was the wrong question, and why the first live attempt parked
+        # with the filler's "no file input found on this form".
+        posted_url = controller.page.url
+        opened_url, opened_label = await open_onsite_application(controller)
+        if opened_url:
+            steps.append(
+                RouteStep(ordinal=len(steps) + 1, kind="click", detail=opened_label or "Apply")
+            )
+            steps.append(
+                RouteStep(
+                    ordinal=len(steps) + 1,
+                    kind="open",
+                    detail=f"{posted_url} -> {opened_url}",
+                )
+            )
+            report = await fill_application_form(
+                controller,
+                memory=service.memory,
+                answers=service.answers,
+                resume=resume,
+                application_id=application_id,
+                company=row.company,
+                job_location=row.location,
+            )
 
     filled_steps = [
         RouteStep(
@@ -278,6 +295,26 @@ async def _fill_and_file(
             or [m.label for m in report.mismatched]
             or report.problems
         )
+        if not report.filled:
+            # A page where nothing at all could be written is not a form with
+            # gaps in it; it is not the form.
+            detail = (
+                "there is no application form on this page, so there is nothing to "
+                "fill and nothing that could be submitted from here."
+            )
+            _remember_blockage(service, row, route, "no form on this page")
+            service.prepare(
+                application_id,
+                ready=False,
+                detail=detail,
+                payload={"missing": ["no application form on this page"]},
+            )
+            return PrepareOutcome(
+                state=ApplicationState.WAITING_FOR_INPUT.value,
+                route=route,
+                missing=["no application form on this page"],
+                detail=detail,
+            )
         _remember_blockage(service, row, route, f"fill: {', '.join(missing) or 'incomplete'}")
         service.prepare(
             application_id,

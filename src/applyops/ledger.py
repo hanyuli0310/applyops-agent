@@ -38,7 +38,7 @@ from .state_machine import (
     require_transition,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 CLAIM_TTL_SECONDS = 600.0
 
@@ -61,6 +61,9 @@ class ApplicationRow:
     state: str
     title: str = ""
     company: str = ""
+    #: Where the posting is. A city question on the application form asks which
+    #: location it is for, and the answer is the employer's -- not the applicant's.
+    location: str = ""
     resume_sha256: str = ""
     profile_revision: str = ""
     answers_revision: str = ""
@@ -176,6 +179,17 @@ class Ledger:
             );
             """
         )
+        # v2: the posting's location. `CREATE TABLE IF NOT EXISTS` above cannot
+        # add a column to a database that already exists, so the upgrade is
+        # explicit and idempotent -- the same shape every later version needs.
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(applications)")
+        }
+        if "location" not in columns:
+            self._conn.execute(
+                "ALTER TABLE applications ADD COLUMN location TEXT NOT NULL DEFAULT ''"
+            )
+
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
 
@@ -190,6 +204,7 @@ class Ledger:
         platform: str = "",
         title: str = "",
         company: str = "",
+        location: str = "",
     ) -> ApplicationRow:
         """Enqueue an application. Deduplicates on `job_key` -- the same posting
         reached twice is one application, not two."""
@@ -202,6 +217,7 @@ class Ledger:
             state=ApplicationState.QUEUED.value,
             title=title,
             company=company,
+            location=location,
             created_at=_now(),
             updated_at=_now(),
         )
@@ -210,11 +226,12 @@ class Ledger:
                 self._conn.execute(
                     """INSERT INTO applications
                        (id, job_key, job_url, route, platform, state, title, company,
-                        created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        location, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         row.id, row.job_key, row.job_url, row.route, row.platform,
-                        row.state, row.title, row.company, row.created_at, row.updated_at,
+                        row.state, row.title, row.company, row.location,
+                        row.created_at, row.updated_at,
                     ),
                 )
         except sqlite3.IntegrityError as exc:
@@ -495,8 +512,8 @@ class Ledger:
                 self._conn.execute(
                     """INSERT INTO applications
                        (id, job_key, job_url, route, platform, state, title, company,
-                        created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        location, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         str(uuid.uuid4()),
                         job_key,
@@ -506,6 +523,7 @@ class Ledger:
                         ApplicationState.LEGACY_IMPORTED.value,
                         str(record.get("job_title", "")),
                         str(record.get("company", "")),
+                        "",
                         str(record.get("applied_at", "")) or _now(),
                         _now(),
                     ),

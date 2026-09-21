@@ -32,6 +32,10 @@ from .resume import ResumeError, ResumeRef
 #: Form label -> profile key. Deliberately explicit and small: a fuzzy matcher
 #: here would be a machine for putting one field's value into another's box.
 LABEL_TO_PROFILE = (
+    # Before the generic name pattern: a modal that asks for the two halves gets
+    # them from the one full name the profile stores (see `profile._split_name`).
+    (re.compile(r"\b(first|given)\s*name\b", re.IGNORECASE), "first_name"),
+    (re.compile(r"\b(last|family|sur)\s*name\b|\bsurname\b", re.IGNORECASE), "last_name"),
     (re.compile(r"full\s*name|^name$|your name", re.IGNORECASE), "name"),
     (re.compile(r"e-?mail", re.IGNORECASE), "email"),
     (re.compile(r"phone|mobile|telephone", re.IGNORECASE), "phone"),
@@ -102,11 +106,18 @@ def resolve_value(
     answers: AnswerStore,
     company: str = "",
     application_id: str = "",
+    job_location: str = "",
 ) -> tuple[str, str] | None:
     """(value, source) for a form label, or None if we do not know it.
 
     Answers before profile: a scoped answer is the user speaking about *this*
     form, which outranks a general fact.
+
+    A **city question** is answered with the posting's location rather than the
+    applicant's, because that is what the question is for: which location this
+    application is for. The source is reported as `job:location` so a person
+    reviewing the approval summary can see that it did not come from their own
+    profile -- a distinction worth keeping visible when the values are similar.
     """
     question = label.strip()
     if question:
@@ -118,6 +129,8 @@ def resolve_value(
 
     for pattern, key in LABEL_TO_PROFILE:
         if pattern.search(label or ""):
+            if key == "location" and (job_location or "").strip():
+                return job_location.strip(), "job:location"
             value = (profile.get(key) or "").strip()
             if value:
                 return value, f"profile:{key}"
@@ -133,6 +146,7 @@ async def fill_application_form(
     resume: ResumeRef | None,
     application_id: str = "",
     company: str = "",
+    job_location: str = "",
 ) -> FillReport:
     """Fill, verify, attach -- then report honestly on what is missing."""
     report = FillReport()
@@ -159,6 +173,7 @@ async def fill_application_form(
             answers=answers,
             company=company,
             application_id=application_id,
+            job_location=job_location,
         )
         is_choice = field_type in {"radio", "checkbox"} or bool(
             BARE_CHOICE_PATTERN.match(label)
