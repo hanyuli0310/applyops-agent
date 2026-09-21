@@ -312,6 +312,16 @@ def build_ref(info: dict) -> str:
         selector = f'[name="{_css_quote(name)}"]'
         if info.get("valueAttribute") and value not in (None, ""):
             selector += f'[value="{_css_quote(str(value))}"]'
+            return f"css={selector}"
+        # No value attribute: every sibling in the group shares this `name`, so
+        # a name-only reference is ambiguous. On a live Ashby question it
+        # ticked the *first* of four options -- an answer the applicant never
+        # gave, and one the read-back confirmed as "verified" because it only
+        # ever looked at the element it had landed on. The option's own text is
+        # the only thing that tells them apart.
+        option_label = info.get("label") or ""
+        if option_label:
+            return f"label={option_label}"
         return f"css={selector}"
 
     element_id = info.get("id") or ""

@@ -184,6 +184,36 @@ async def fill_application_form(
         is_choice = field_type in {"radio", "checkbox"} or bool(
             BARE_CHOICE_PATTERN.match(label)
         )
+        if is_choice and not BARE_CHOICE_PATTERN.match(label):
+            # A group of named options (A/B/C/D, or a multi-select list) rather
+            # than a Yes/No pair. The applicant's own answer for the question
+            # names one of the options; pick that one and leave its siblings
+            # alone. Nothing is inferred: without a stored answer the question
+            # is reported as unanswered, which is what keeps this from ever
+            # claiming an option the applicant did not choose.
+            question = question_for(label, control.group_label)
+            entry = answers.resolve(
+                question, company=company, application_id=application_id
+            )
+            if entry is None:
+                # Some sites (Ashby among them) give an option no group label
+                # at all, so the question cannot be identified -- only the
+                # option itself can. The applicant's answer to *this option*
+                # is then the key, and it is read the same way: a stored "yes"
+                # selects it, a stored "no" does not.
+                entry = answers.resolve(
+                    label, company=company, application_id=application_id
+                )
+            if entry is not None:
+                wanted = (entry.answer or "").strip().casefold()
+                option = (label or "").strip().casefold()
+                affirmative = wanted in {"yes", "y", "true", "1", "是"}
+                if (affirmative or option == wanted or (wanted and option.startswith(wanted))) \
+                        and not wanted in {"no", "n", "false", "0"}:
+                    resolved = ("checked", f"answer:{entry.scope}")
+                else:
+                    continue  # a sibling option, or an explicit "no"
+
         if is_choice and BARE_CHOICE_PATTERN.match(label):
             question = question_for(label, control.group_label)
             wanted, source = choice_answer(
