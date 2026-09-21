@@ -255,7 +255,83 @@ legacy/                 # the retired v1 (self-owned agent loop + LLM + Web UI)
 `legacy/` is dead code, kept as a rollback point and as the record of why the
 architecture turned. Nothing in `src/` imports it.
 
-## 12. Unattended runs
+## 12. Target job titles
+
+The pool of titles the agent is for. It answers one question only: **is this
+posting the kind of job we are looking for?** Everything else — how a resume is
+picked, how a description is scored, work authorization, location, seniority —
+is deliberately not defined here.
+
+These are **semantic targets, not exact strings.** A posting matches when its
+title means one of these jobs, not when it spells one of them exactly. Common
+naming variations, punctuation and separator differences, abbreviations, and
+closely equivalent titles all count. `Software Engineer - AI`, `AI Applications
+Developer` and `Member of Technical Staff, AI` are all in scope even though none
+of them appears on the list verbatim.
+
+The line runs at "is this an engineering or applied-research job in software, AI
+or ML". It does not extend sideways into analyst, finance, accounting, product
+management, QA, IT support, sales, or other non-technical business roles. When a
+title is genuinely ambiguous, treat it as out of scope rather than stretching a
+neighbour in the list to cover it.
+
+### Software engineering — general and entry level
+
+- Software Engineer
+- Software Development Engineer
+- Software Engineer I
+- Associate Software Engineer
+- Entry Level Software Engineer
+- Early Career Software Engineer
+- New Grad Software Engineer
+- University Graduate Software Engineer
+
+### Backend and full stack
+
+- Backend Software Engineer
+- Backend Engineer
+- Full Stack Software Engineer
+- Full Stack Engineer
+
+### Product and platform
+
+- Product Engineer
+- Platform Engineer
+
+### AI and machine learning
+
+- AI Engineer
+- AI Software Engineer
+- Applied AI Engineer
+- AI Application Engineer
+- AI/ML Engineer
+- Machine Learning Engineer
+- ML Engineer
+- Machine Learning Software Engineer
+- Applied Machine Learning Engineer
+- Generative AI Engineer
+- LLM Engineer
+- AI Agent Engineer
+- AI Product Engineer
+
+### Applied research and data
+
+- Forward Deployed Engineer
+- Research Engineer
+- AI Research Engineer
+- Computer Vision Engineer
+- Data Scientist
+
+Adding a title is appending one line to the group it belongs in. Nothing else
+has to change for the pool to grow.
+
+**This section is the written definition of intent, not the switch that flips
+it.** What the unattended runners actually search for today is still
+`KEYWORDS` in `tools/auto_apply.py` — a handful of LinkedIn query strings, which
+is a different and much blunter thing. Keeping the two in step is a change to
+that file, not to this one.
+
+## 13. Unattended runs
 
 Two runners exist for applying without a conversation. Both take the same
 browser lock, so neither can collide with the other or with you.
