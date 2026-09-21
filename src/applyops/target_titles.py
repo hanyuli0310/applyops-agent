@@ -138,3 +138,39 @@ def from_agents_md(path: str | Path) -> dict[str, tuple[str, ...]]:
         elif current and line.startswith("- "):
             groups[current].append(line[2:].strip())
     return {name: tuple(titles) for name, titles in groups.items() if titles}
+
+
+#: Titles that read as a more senior job than this installation is for.
+#: `AGENTS.md` §12 records who the applicant is — a recent graduate starting a
+#: first engineering job — so a posting that says senior, staff, principal, lead
+#: or manager is out of scope **even when the work matches the pool below**.
+#: Seniority is a separate question from "what kind of work", which is why it is
+#: a separate pattern rather than more entries in the pool.
+SENIORITY_PATTERN = re.compile(
+    r"\b(senior|sr\.?|staff|principal|lead|leader|manager|head\s+of|director|"
+    r"architect|distinguished|fellow|vp|vice\s+president)\b",
+    re.IGNORECASE,
+)
+
+#: Titles that say, in words, that the posting is for someone starting out.
+ENTRY_LEVEL_PATTERN = re.compile(
+    r"\b(new\s+grad(uate)?|entry[\s-]?level|early\s+career|associate|"
+    r"junior|jr\.?|graduate|intern|apprentice|i{1,2}\b)\b",
+    re.IGNORECASE,
+)
+
+
+def is_entry_level(title: str) -> bool:
+    """Whether a posting's title fits the applicant described in §12.
+
+    A title that says "senior" or "staff" is out of scope for a new grad even
+    when the work would otherwise match; a title that says "new grad" or "entry
+    level" is in scope even when it also says something else. Anything the
+    pattern cannot classify is *kept* -- the cost of reading one extra posting is
+    a minute, and silently dropping a job someone could have applied for is not a
+    cost this function is allowed to impose.
+    """
+    text = title or ""
+    if ENTRY_LEVEL_PATTERN.search(text):
+        return True
+    return not SENIORITY_PATTERN.search(text)

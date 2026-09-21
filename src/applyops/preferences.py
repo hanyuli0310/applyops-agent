@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .concurrency import FileLock, atomic_write_json, data_lock_path, read_json
+from .target_titles import is_entry_level
 
 
 def _now() -> str:
@@ -103,6 +104,20 @@ def evaluate(
                 "keep": False,
                 "reasons": [f"company matches an exclusion rule: {blocked[0]}"],
             }
+
+    # Seniority first: it is a fact about the applicant (AGENTS.md §12), not a
+    # preference, so a title that reads as senior comes back out before anything
+    # else is even considered.
+    if not is_entry_level(title):
+        return {
+            "keep": False,
+            "reasons": [
+                (
+                    "title reads as senior/staff/principal -- this search is for a "
+                    "new grad, and the work matching is not enough (AGENTS.md §12)"
+                )
+            ],
+        }
 
     excluded = [k for k in prefs.exclude_keywords if k.strip().casefold() in (title or "").casefold()]
     if excluded:
