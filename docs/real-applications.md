@@ -77,6 +77,17 @@ control into someone else's system is a decision per posting, not a convenience.
   real observation.
 - **Forms can be long.** Greenhouse's MongoDB form asks 18 required answers
   including Country, Preferred Name and a full demographic survey (§6).
+- **The form may be in a cross-origin iframe.** Verified on that same posting:
+  the host page (`www.mongodb.com/careers/jobs/7742875`) has **2** controls, while
+  `job-boards.greenhouse.io/embed/job_app?for=mongodb&validityToken=…` — an
+  iframe — has **36**. Field discovery walks frames, so the fields are found and
+  written; what broke was the *read-back* (§6).
+- **A cookie-consent overlay can intercept every click.** On that page OneTrust's
+  banner (`#onetrust-consent-sdk`) sits over the form, and Playwright retries the
+  click until it times out:
+  `<div id="onetrust-button-group">… intercepts pointer events`.
+  Dismiss the banner before touching the form, or interactions will look like
+  "the control is there but nothing happens".
 
 ## 5. Rules that must not be broken
 
@@ -109,10 +120,15 @@ These used to be enforced by the test suite; the suite was removed on
 
 - **Read-back on employer forms.** On Greenhouse/MongoDB every core field
   (First Name, Last Name, Email, Phone, Location, Resume) came back
-  `unverifiable` — written, but the value could not be confirmed. On
-  `careers-page.com` the same fields read back fine, so this is specific to how
-  that page exposes its inputs. `[unverifiable]` is not "wrong": it means the
-  product will not claim a value it could not confirm.
+  `unverifiable` — written, but the value could not be confirmed. The cause is
+  now known: **the form lives in a cross-origin iframe** (§4), on a host page
+  whose own document has almost nothing in it, and with a consent overlay on top.
+  On `careers-page.com` the same fields read back fine, so this is specific to
+  how that page exposes its inputs. `[unverifiable]` is not "wrong": it means the
+  product will not claim a value it could not confirm — and it is a *safety*
+  detail, because an approval summary built from unreadable fields may not show
+  what would actually be sent. Do not submit from a form whose core fields are
+  unverifiable.
 - **`careers-page.com` had its own four**: `phone` and `years of experience`
   (twice) came back `mismatch`, `Salary` was `unreadable`, and a repeated
   `full name` section was `unverifiable`.

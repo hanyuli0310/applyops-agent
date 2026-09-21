@@ -257,6 +257,16 @@ architecture turned. Nothing in `src/` imports it.
 
 ## 12. Target job titles
 
+**Who this is for.** The person this installation serves is a recent graduate
+starting their first engineering job — a **new grad / entry-level** candidate.
+The pool below defines the *kind of work*; seniority is a separate question and,
+for this candidate, it is already settled: **only new grad, entry level, early
+career, associate and university graduate titles are in scope.** A posting whose
+title says senior, staff, principal, lead or manager is out of scope even when
+the work matches one of the titles below. This is a fact about the applicant, not
+a preference — it is written here because everything that decides "is this
+posting for us" has to read it from the same place.
+
 The pool of titles the agent is for. It answers one question only: **is this
 posting the kind of job we are looking for?** Everything else — how a resume is
 picked, how a description is scored, work authorization, location, seniority —
