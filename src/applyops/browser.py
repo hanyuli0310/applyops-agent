@@ -216,6 +216,14 @@ DEFAULT_DEBUG_PORT = 9222
 DEVTOOLS_PORT_FILE = "DevToolsActivePort"
 
 
+def _forget_devtools_port(profile: Path) -> None:
+    """Drop a `DevToolsActivePort` that no longer describes a live browser."""
+    try:
+        (profile / DEVTOOLS_PORT_FILE).unlink()
+    except OSError:
+        pass
+
+
 def profile_debug_port(profile: Path) -> int:
     """The debugging port a browser on this profile is listening on, or 0."""
     try:
@@ -282,10 +290,19 @@ class BrowserController:
         # the profile's own `DevToolsActivePort` file, so another data directory's
         # browser cannot be hijacked by us sharing a port number with it.
         existing_port = await asyncio.to_thread(profile_debug_port, self._user_data_dir)
+        if existing_port and not await asyncio.to_thread(self.endpoint_up, existing_port):
+            # The file outlives the browser that wrote it. A Chrome that has
+            # since exited leaves its port number behind, and trusting that
+            # number meant claiming the profile was free -- then failing to
+            # launch because the *live* browser (the one on screen, started by
+            # `tools/attach.py`) already holds it. A stale file is not evidence.
+            _forget_devtools_port(self._user_data_dir)
+            existing_port = 0
         # The one exception, and it is a convention rather than a guess:
-        # `tools/attach.py` starts the *project's* browser with a fixed port. No
-        # other profile inherits that, so a temporary one can never attach to a
-        # stranger's browser by accident.
+        # `tools/attach.py` starts the *project's* browser with a fixed port --
+        # and passes it explicitly, so Chrome writes no `DevToolsActivePort` at
+        # all. No other profile inherits that, so a temporary one can never
+        # attach to a stranger's browser by accident.
         if (
             not existing_port
             and self._is_project_profile()
@@ -607,6 +624,22 @@ class BrowserController:
             for char in value:
                 await self.page.keyboard.type(char)
                 await asyncio.sleep(random.uniform(TYPING_MIN_DELAY, TYPING_MAX_DELAY))
+            # A typeahead's real value is the suggestion it offers, not the
+            # keystrokes -- and the keystrokes alone read back as a mismatch or
+            # as unverifiable while looking fine on screen. The suggestion is
+            # chosen by clicking it, never with Enter (which inside a form can
+            # submit the very application we are only filling in), and the click
+            # has to happen *before* the Tab below: Tab commits on blur, and it
+            # also closes the suggestion list, so afterwards there is nothing
+            # left to click.
+            await asyncio.sleep(0.8)
+            chosen = await _choose_suggestion(self.page, element, value)
+            if chosen:
+                await asyncio.sleep(0.4)
+                readback, readable = await _read_element_value(element)
+                return FillResult.from_verification(
+                    verify_text_value(chosen, readback, readable=readable)
+                )
             # Commit: some components only publish their value on blur.
             await element.press("Tab")
             await asyncio.sleep(0.2)
@@ -1012,6 +1045,45 @@ _READ_VALUE_JS = """el => {
     if (el.isContentEditable) return String(el.innerText ?? '');
     return String(el.getAttribute('aria-valuetext') || el.innerText || '').trim();
 }"""
+
+
+async def _choose_suggestion(page: Page, element: Locator, typed: str) -> str | None:
+    """Click the first visible suggestion that matches what was typed.
+
+    Returns the text of the suggestion that was clicked, not merely whether one
+    was. A typeahead keeps its own canonical label -- typing "Sunnyvale, CA"
+    into Ashby commits "Sunnyvale, California, United States", so comparing the
+    read-back against what was *typed* reports a mismatch on a field that is in
+    fact filled correctly. The clicked suggestion is the value the applicant
+    actually chose, so it is the only honest thing to verify against.
+    """
+    wanted = (typed or "").strip().casefold().split(",")[0].strip()
+    if not wanted:
+        return None
+    try:
+        # Deliberately broad: Ashby's suggestions are plain <li> elements with
+        # no ARIA role at all, so a selector that only looked for
+        # [role=option] found nothing and the typeahead stayed unverifiable.
+        options = page.locator(
+            "[role=option], [role=listbox] li, "
+            "ul[class*=option] li, ul[class*=suggestion] li, li[class*=option]"
+        )
+        count = await options.count()
+    except Exception:  # noqa: BLE001 - no suggestion list means no suggestion
+        return False
+    for index in range(min(count, 8)):
+        option = options.nth(index)
+        try:
+            if not await option.is_visible():
+                continue
+            text = (await option.inner_text()).strip()
+            if wanted in text.casefold():
+                await option.click(timeout=3000)
+                await asyncio.sleep(0.3)
+                return text
+        except Exception:  # noqa: BLE001, S112 - try the next candidate suggestion
+            continue
+    return None
 
 
 async def _read_element_value(element: Locator) -> tuple[str | None, bool]:

@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .apply_target import (
+    captcha_wall,
     follow_offsite_apply,
     form_control_count,
     has_apply_control,
@@ -293,6 +294,30 @@ async def _fill_and_file(
                 detail=f"resume <- {report.resume.source}",
                 selector=report.resume.ref,
             )
+        )
+
+    if not report.ready and await captcha_wall(controller):
+        # Nothing here is wrong; the last step simply is not ours. Say which
+        # step, and leave the form filled and waiting. A real application was
+        # already lost to this: clicked, silently ignored, no confirmation and
+        # no email.
+        detail = (
+            "this form asks for a CAPTCHA before it will accept the application, "
+            "which no machine can answer; everything else is filled and waiting. "
+            "Solve it and submit in the browser."
+        )
+        _remember_blockage(service, row, route, "captcha required")
+        service.prepare(
+            application_id,
+            ready=False,
+            detail=detail,
+            payload={"missing": ["a human must solve the CAPTCHA"]},
+        )
+        return PrepareOutcome(
+            state=ApplicationState.WAITING_FOR_INPUT.value,
+            route=route,
+            missing=["a human must solve the CAPTCHA"],
+            detail=detail,
         )
 
     if not report.ready:

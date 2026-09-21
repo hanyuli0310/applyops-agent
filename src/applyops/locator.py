@@ -39,6 +39,7 @@ survives exactly the kind of churn that breaks an id-equality match.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Optional
 
@@ -48,9 +49,16 @@ from pydantic import BaseModel, Field
 # Controls we care about. `:not([type=hidden])` because a hidden input is not a
 # question, and a form that reports hidden fields as answerable is worse than one
 # that reports nothing.
+# A Yes/No question on Ashby is two <button aria-pressed> elements sitting over
+# a `tabindex="-1"` input that cannot be clicked. A selector of inputs alone
+# cannot see the question at all -- it is neither answered nor reported missing,
+# and the application then fails at submit on a question nobody was asked. The
+# button form is matched narrowly (it must carry `data-option` or a yes/no
+# class) so an unrelated toggle button does not become a form field.
 CONTROL_SELECTOR = (
     'input:not([type="hidden"]), textarea, select, '
     '[role="combobox"], [role="listbox"], [role="radio"], [role="checkbox"], '
+    'button[aria-pressed][data-option], button[aria-pressed][class*=yesno], '
     '[contenteditable="true"]'
 )
 
@@ -161,6 +169,7 @@ _JS_DESCRIBE = """
   // taken from the nearest fieldset legend or ARIA group label -- inside this
   // control's own group only, never from the page as a whole.
   let group = '';
+  let groupRequired = false;
   let node = el;
   for (let i = 0; i < 6 && node; i++) {
     const tag = (node.tagName || '').toLowerCase();
@@ -179,6 +188,59 @@ _JS_DESCRIBE = """
       break;
     }
     node = node.parentElement;
+  }
+
+  // Last resort, and the one Ashby needs: the question lives in a heading near
+  // the options with no legend and no ARIA group label at all. Without it the
+  // group was empty, which cost two things -- the required asterisk on the
+  // *question* was never seen (so a required multi-select looked optional and
+  // nothing reported it), and a named option could not be matched to its
+  // question.
+  {
+    // Walk up for the question that owns this control, whether or not a group
+    // was found above. Two things are read from it, and the second is why this
+    // is no longer inside `if (!group)`: the required marker lives in the *class*
+    // of the title ("_required_") with the asterisk as a separate element, so no
+    // attribute and no text says "required". Reading it only when the group was
+    // still empty made a required Yes/No question look optional -- it was never
+    // filled and never reported, and the submission was rejected for a question
+    // nobody knew had been asked.
+    let up = el;
+    for (let i = 0; i < 8 && up; i++) {
+      up = up.parentElement;
+      if (!up) break;
+      const titled = up.querySelector(
+        '.ashby-application-form-question-title, [class*=question-title], '
+        + 'legend, h1, h2, h3, h4, h5, h6'
+      );
+      const text = titled ? norm(titled.textContent) : '';
+      if (!text || text.length >= 300) { continue; }
+      if (!group) { group = text; }
+      const marks = ((titled.className || '') + ' '
+        + ((titled.parentElement && titled.parentElement.className) || ''));
+      if (/required/i.test(marks)) { groupRequired = true; }
+      break;
+    }
+  }
+
+  // The same doubling, applied to the *question*. LinkedIn renders the question
+  // twice inside the group and appends its own "Required" marker, so the group
+  // read "Bachelor's Degree?Have you completed ... : Bachelor's Degree? Required"
+  // -- a key that matches no stored answer. The applicant had answered this
+  // question many times and it still came back unanswered, and the report named
+  // a question nobody could find in the answer store because of a stray space.
+  if (group) {
+    let g = group.trim();
+    const trailingRequired = /^(.*?)\\s*Required\\s*$/i.exec(g);
+    if (trailingRequired && trailingRequired[1].trim()) { g = trailingRequired[1].trim(); }
+    const gHalf = g.length / 2;
+    if (Number.isInteger(gHalf)) {
+      if (g.slice(0, gHalf).trim() === g.slice(gHalf).trim()) { g = g.slice(0, gHalf).trim(); }
+    } else if (Math.floor(gHalf) > 3) {
+      const gk = Math.floor(gHalf);
+      if (g.slice(0, gk).trim() === g.slice(gk).trim()) { g = g.slice(0, gk).trim(); }
+    }
+    group = g;
   }
 
   // A label rendered twice is noise, not a different question. LinkedIn does
@@ -228,15 +290,27 @@ _JS_DESCRIBE = """
   else if (attr('contenteditable') === 'true') fieldType = 'contenteditable';
   else if (tag === 'input' && (type === 'radio' || type === 'checkbox')) fieldType = type;
 
+  const pressedAttr = attr('aria-pressed');
+  const isToggle = tag === 'button' && (pressedAttr === 'true' || pressedAttr === 'false');
+
   let checked = null;
-  if ('checked' in el && (type === 'radio' || type === 'checkbox' || role === 'radio' || role === 'checkbox')) {
+  if (isToggle) {
+    checked = pressedAttr === 'true';
+    fieldType = 'radio';
+    // The button's own text *is* the option ("Yes" / "No"); the question is the
+    // group above it. Left as-is, the ancestor climb earlier finds the
+    // question's <label> and both buttons report the question as their label --
+    // they become one indistinguishable field and neither can be chosen.
+    const own = norm(el.textContent || '');
+    if (own) { label = own; how = 'button-text'; }
+  } else if ('checked' in el && (type === 'radio' || type === 'checkbox' || role === 'radio' || role === 'checkbox')) {
     if (type === 'radio' || type === 'checkbox') checked = el.checked;
     else checked = attr('aria-checked') === 'true';
   }
 
   // Option text for a radio/checkbox is the wrapping label's text.
   let optionText = '';
-  if (checked !== null) {
+  if (checked !== null && !isToggle) {
     const wrap = (el.closest && el.closest('label')) || el.parentElement;
     optionText = norm(wrap ? wrap.textContent : '');
     if (optionText && optionText.slice(0, 80) !== label.slice(0, 80)) {
@@ -256,7 +330,18 @@ _JS_DESCRIBE = """
     fieldType: fieldType,
     name: attr('name') || '',
     value: (el.value === undefined || el.value === null) ? '' : String(el.value).slice(0, 200),
-    required: !!el.required || attr('aria-required') === 'true',
+    // Three ways a form says "required", and the third is the one that bit us:
+    // Ashby marks a question with a trailing asterisk in its label and sets no
+    // `required` attribute at all, so a required multi-select looked optional --
+    // nothing reported it as missing, and the submitted application was rejected
+    // by a validation error nobody had been told about.
+    required: !!el.required
+      || attr('aria-required') === 'true'
+      || String(label || '').trim().endsWith('*')
+      || String(label || '').trim().endsWith('✱')
+      || String(group || '').trim().endsWith('*')
+      || String(group || '').trim().endsWith('✱')
+      || groupRequired,
     disabled: !!el.disabled || attr('aria-disabled') === 'true',
     options: options.slice(0, 200),
     valueAttribute: attr('value') || '',
@@ -399,19 +484,22 @@ _MIN_FRAME_PX = 2
 async def _frame_is_visible(frame: Frame) -> bool:
     """True when the iframe actually occupies space on the page."""
     try:
-        element = await frame.frame_element()
+        # A detached or cross-origin iframe can leave Playwright waiting on a
+        # CDP response indefinitely. Field discovery must remain bounded: a
+        # decorative frame is never worth stalling the whole application.
+        element = await asyncio.wait_for(frame.frame_element(), timeout=1.5)
         if element is None:
             return False
-        if not await element.is_visible():
+        if not await asyncio.wait_for(element.is_visible(), timeout=1.5):
             return False
-        box = await element.bounding_box()
+        box = await asyncio.wait_for(element.bounding_box(), timeout=1.5)
         if not box:
             return False
         return box["width"] > _MIN_FRAME_PX and box["height"] > _MIN_FRAME_PX
     except Exception:
-        # If the frame cannot be introspected, keep it: losing a real
-        # application form is far worse than reporting one extra field.
-        return True
+        # A frame that cannot be inspected is not safe to treat as form
+        # content; keeping it here can hang every subsequent field scan.
+        return False
 
 
 async def _frames(page: Page) -> list[Frame]:
@@ -537,6 +625,46 @@ async def resolve_ref(page: Page, ref: str) -> Optional[Locator]:
                             return locator.first
                     except Exception:  # noqa: BLE001 - try the next strategy
                         continue
+        # Before falling back to the text, try the control the label *belongs*
+        # to when the association is broken. Ashby renders "Where are you
+        # currently based?" as a `<label for="_systemfield_location">` whose
+        # target does not exist (a React-controlled input with no id), so
+        # get_by_label finds nothing and the text fallback lands on the label --
+        # and writing to a label reads back the question, which is a mismatch,
+        # every time. The control is in the label's own container; find it there.
+        for frame in await _frames(page):
+            try:
+                marker = await frame.evaluate(
+                    """text => {
+                      const wanted = String(text || '').trim().toLowerCase();
+                      if (!wanted) return '';
+                      for (const label of document.querySelectorAll('label')) {
+                        const own = (label.innerText || '').trim().toLowerCase();
+                        if (!own || !own.includes(wanted)) continue;
+                        const direct = label.control
+                          || (label.htmlFor ? document.getElementById(label.htmlFor) : null);
+                        const host = label.parentElement || label.closest('div');
+                        const control = direct
+                          || (host ? host.querySelector('input,textarea,select') : null);
+                        if (!control) continue;
+                        const token = 'applyops-ref-' + Math.random().toString(36).slice(2, 9);
+                        control.setAttribute('data-applyops-ref', token);
+                        return token;
+                      }
+                      return '';
+                    }""",
+                    value,
+                )
+            except Exception:
+                marker = ""
+            if marker:
+                candidate = frame.locator(f'[data-applyops-ref="{marker}"]').first
+                try:
+                    if await candidate.count():
+                        return candidate
+                except Exception:
+                    pass
+
         # Nothing carried that accessible name. Fall back to the visible text
         # itself -- clicking a label toggles the control it belongs to, which is
         # enough for choosing a resume or agreeing to a term.

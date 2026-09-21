@@ -37,6 +37,7 @@ from .guardrails import Guardrails
 from .ledger import ApplicationRow, Ledger
 from .memory import MemoryStore
 from .resume import ResumeRef
+from .target_titles import is_entry_level
 from .state_machine import ApplicationState, InvalidTransition
 from .submission import (
     STATUS_UNVERIFIED,
@@ -125,7 +126,21 @@ class ApplicationService:
         company: str = "",
         location: str = "",
     ) -> ApplicationRow:
-        """Accept a posting into the queue. Idempotent per job key."""
+        """Accept a posting into the queue. Idempotent per job key.
+
+        Seniority is refused here rather than filtered later. `preferences.
+        evaluate` has always said a senior title is out -- it is a fact about
+        the applicant (AGENTS.md §12: a new grad), not a preference -- but
+        nothing ever called it, so senior postings were enqueued like any
+        other and had to be cleared out by hand. Refused loudly, with the
+        reason, because a queue that silently drops what you asked for looks
+        broken.
+        """
+        if title and not is_entry_level(title):
+            raise SubmissionRefused(
+                f"not entry level: {title!r} reads as senior/staff/principal "
+                "and this search is for a new grad (AGENTS.md §12)"
+            )
         return self.ledger.create_application(
             job_key=job_id or job_url,
             job_url=job_url,

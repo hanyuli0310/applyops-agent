@@ -301,3 +301,34 @@ async def sign_in_wall(controller: BrowserController) -> str:
     if found.get("hasPassword") and words:
         return words
     return ""
+
+
+async def captcha_wall(controller: BrowserController) -> str:
+    """The CAPTCHA this page is asking a human to solve, or "".
+
+    A form with a CAPTCHA cannot be submitted by a machine: the click lands, the
+    challenge is unanswered, and the employer quietly ignores the application --
+    which is exactly what happened to a real one here (sent, no confirmation, no
+    email, and a form that re-rendered as if nothing had been typed). Better to
+    say so and hand the last step to the person than to report "unverified" and
+    leave them guessing.
+    """
+    try:
+        found = await controller.page.evaluate(
+            """() => {
+              const hits = [];
+              for (const sel of [
+                '.g-recaptcha', '[data-sitekey]', 'iframe[src*="recaptcha"]',
+                'iframe[src*="hcaptcha"]', 'textarea[name="g-recaptcha-response"]',
+                '[class*="cf-turnstile"]', '[class*="h-captcha"]'
+              ]) {
+                const el = document.querySelector(sel);
+                if (el) hits.push(sel);
+              }
+              return hits;
+            }"""
+        )
+    except Exception:  # noqa: BLE001 - an unreadable page claims nothing
+        return ""
+    hits = [h for h in (found or []) if isinstance(h, str)]
+    return hits[0] if hits else ""

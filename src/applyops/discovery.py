@@ -119,13 +119,21 @@ def clean_title(text: str) -> str:
     return title
 
 
+# Asking LinkedIn for entry level is the default, not an option: who is applying
+# is a fact (AGENTS.md §12 -- a new grad), so the search should be built for him
+# rather than for whoever calls it. Left as a switch because the facet has to be
+# droppable, but a default of False meant every search came back full of senior
+# postings that then had to be filtered and skipped by hand.
+ENTRY_LEVEL_BY_DEFAULT = True
+
+
 def build_search_url(
     keywords: str,
     location: str = "",
     easy_apply_only: bool = True,
     recent_days: int = 0,
     start: int = 0,
-    entry_level_only: bool = False,
+    entry_level_only: bool = ENTRY_LEVEL_BY_DEFAULT,
 ) -> str:
     """Compose a jobs search URL.
 
@@ -346,7 +354,7 @@ async def search(
     easy_apply_only: bool = True,
     recent_days: int = 0,
     passes: int = DEFAULT_PASSES,
-    entry_level_only: bool = False,
+    entry_level_only: bool = ENTRY_LEVEL_BY_DEFAULT,
 ) -> SearchResult:
     """Run a search and return the postings found.
 

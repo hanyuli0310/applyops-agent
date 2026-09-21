@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from . import concurrency
 from .platforms.detector import detect_platform
@@ -340,8 +340,61 @@ class RouteKnowledge(BaseModel):
     steps: list[RouteStep] = Field(default_factory=list)
     runs: int = 0
     successes: int = 0
+    #: Every blockage ever recorded on this route, counted. This is the raw
+    #: evidence and it is never edited in place: dropping an entry here is what
+    #: used to be undone by the next save, because the merge rebuilds it from
+    #: disk by taking the largest count.
+    blockage_counts: dict[str, int] = Field(default_factory=dict)
+    #: Gates this route has been *proven* to pass, mapped to the count they were
+    #: retracted at. A retraction forgives every blockage up to that count and
+    #: no later one, so a gate that blocks again simply outgrows it.
+    retracted_at: dict[str, int] = Field(default_factory=dict)
+    #: Derived: `blockage_counts` minus what has been retracted. Read this, and
+    #: never treat a retracted gate as a wall -- a route that has been walked to
+    #: the end does not stop at a door it has already opened.
     blocked_at: dict[str, int] = Field(default_factory=dict)
     notes: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _read_older_shapes(cls, data):
+        """Read the shapes this record has had, rather than only the latest.
+
+        Two shape changes are absorbed here, and both matter for the same
+        reason: a memory file that cannot be parsed is treated as no memory at
+        all, which drops every accumulated answer and every recorded route in a
+        single read.
+
+        `retracted_at` was briefly a list of gate names -- read as "retracted,
+        forgiving everything counted so far". And `blocked_at` used to *be* the
+        count, before the raw counts were split out: files written then have no
+        `blockage_counts`, and seeding from `blocked_at` is what keeps a save
+        from recomputing the derived value out of an empty record and
+        discarding every gate the route was known to die at.
+
+        Done on the whole record rather than per field because the two fields
+        are read against each other, and pydantic validates them in
+        declaration order.
+        """
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        if not data.get("blockage_counts"):
+            data["blockage_counts"] = dict(data.get("blocked_at") or {})
+        retracted = data.get("retracted_at")
+        if isinstance(retracted, list):
+            # "Forgiving everything counted so far" -- the count it was made at
+            # is what a later blockage has to outgrow.
+            counts = data["blockage_counts"]
+            data["retracted_at"] = {
+                gate: counts.get(gate, 0) for gate in retracted if isinstance(gate, str)
+            }
+        return data
+
+    @model_validator(mode="after")
+    def _derive_blocked(self):
+        _recompute_blocked(self)
+        return self
 
     @property
     def key(self) -> str:
@@ -673,6 +726,19 @@ _SEED_ROUTES: dict[str, dict] = {
         "notes": "Fallback shape for an employer system with no dedicated route yet.",
     },
 }
+
+
+def _recompute_blocked(record: RouteKnowledge) -> None:
+    """Rebuild `blocked_at` from the raw counts minus what was retracted.
+
+    Kept as one function because it is the only place the two kinds of
+    evidence meet, and doing it in three places is how they drifted apart.
+    """
+    record.blocked_at = {
+        gate: count
+        for gate, count in record.blockage_counts.items()
+        if count > record.retracted_at.get(gate, 0)
+    }
 
 
 class MemoryStore:
@@ -1053,10 +1119,16 @@ class MemoryStore:
                 if getattr(theirs, field) > getattr(mine, field):
                     setattr(mine, field, getattr(theirs, field))
                     conflicts += 1
-            for gate, count in theirs.blocked_at.items():
-                if count > mine.blocked_at.get(gate, 0):
-                    mine.blocked_at[gate] = count
-                    conflicts += 1
+            for gate, count in theirs.blockage_counts.items():
+                if count > mine.blockage_counts.get(gate, 0):
+                    mine.blockage_counts[gate] = count
+            for gate, count in theirs.retracted_at.items():
+                if count > mine.retracted_at.get(gate, 0):
+                    mine.retracted_at[gate] = count
+            before = dict(mine.blocked_at)
+            _recompute_blocked(mine)
+            if mine.blocked_at != before:
+                conflicts += 1
         return conflicts
 
     def _merge_history(self, disk: MemoryData) -> None:
@@ -1450,7 +1522,34 @@ class MemoryStore:
         """
         record = self.get_route(platform, route)
         if step:
-            record.blocked_at[step] = record.blocked_at.get(step, 0) + 1
+            # Counted against the raw evidence, so a gate that blocks again
+            # outgrows its old retraction instead of being silently forgiven.
+            record.blockage_counts[step] = record.blockage_counts.get(step, 0) + 1
+            _recompute_blocked(record)
+        if notes:
+            record.notes = notes
+        self._save()
+        return record
+
+    def clear_route_blockage(
+        self, platform: str, route: str, step: str, notes: str = ""
+    ) -> RouteKnowledge:
+        """Retract a gate this route has been proven to pass.
+
+        A blockage could only ever be added, never withdrawn, so a route that
+        had been walked to the end still announced the gate it once died at --
+        and the next run treated that stale sentence as a wall and stopped in
+        front of a door that was open. Evidence outweighs history: when the
+        route completes, the gate goes.
+        """
+        record = self.get_route(platform, route)
+        if step:
+            # Forgive everything counted so far; a later blockage is a higher
+            # count and stands on its own.
+            record.retracted_at[step] = max(
+                record.retracted_at.get(step, 0), record.blockage_counts.get(step, 0)
+            )
+            _recompute_blocked(record)
         if notes:
             record.notes = notes
         self._save()

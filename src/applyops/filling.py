@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from .answers import AnswerStore
+from .answers import AnswerStore, classify_question
 from .browser import BrowserController
 from .memory import MemoryStore
 from .resume import ResumeError, ResumeRef
@@ -43,6 +43,13 @@ LABEL_TO_PROFILE = (
     (re.compile(r"\b(first|given)\s*name\b", re.IGNORECASE), "first_name"),
     (re.compile(r"\b(last|family|sur)\s*name\b|\bsurname\b", re.IGNORECASE), "last_name"),
     (re.compile(r"full\s*name|^name$|your name", re.IGNORECASE), "name"),
+    # Profile URLs: nearly every employer form asks for them, and they are facts
+    # about the applicant that live in the profile once. Note the spelling
+    # "Linkedin" (no capital I) -- that is how Ashby labels it, and a pattern
+    # that only matched "LinkedIn" left the field blank.
+    (re.compile(r"linked\s*in\s*(profile\s*)?(url|link|address)?", re.IGNORECASE), "linkedin_url"),
+    (re.compile(r"github\s*(profile\s*)?(url|link|address)?", re.IGNORECASE), "github_url"),
+    (re.compile(r"(personal|portfolio)\s*(website|site)\s*(url|link)?|website\s*url", re.IGNORECASE), "website_url"),
     (re.compile(r"e-?mail", re.IGNORECASE), "email"),
     (re.compile(r"phone|mobile|telephone", re.IGNORECASE), "phone"),
     (re.compile(r"years?\s+of\s+experience|experience.*years", re.IGNORECASE), "years_experience"),
@@ -58,7 +65,19 @@ LABEL_TO_PROFILE = (
 #: Labels whose answer is "which of these options", resolved through answers
 #: rather than invented. Kept separate so the reason a field is unresolved is
 #: legible in the report.
-SPONSORSHIP_PATTERN = re.compile(r"sponsor", re.IGNORECASE)
+# Not every sponsorship question uses the word. Ashby asks "Do you need a Work
+# VISA to work in the country where this job is located?" -- the same question
+# the user has already answered ("requires_sponsorship: yes", F-1 CPT/OPT), and
+# one this pattern used to miss entirely, so a required Yes/No stayed blank and
+# blocked the submit. "Authorized to work" is deliberately *not* matched: that
+# is a different question with a different answer, and answering it from the
+# sponsorship field would be right only by accident.
+SPONSORSHIP_PATTERN = re.compile(
+    r"sponsor"
+    r"|work\s*(?:visa|permit)"
+    r"|(?:need|require|obtain)[^.?]{0,30}\bvisa\b",
+    re.IGNORECASE,
+)
 
 FILE_LABEL_PATTERN = re.compile(r"resume|cv\b|curriculum", re.IGNORECASE)
 
@@ -147,6 +166,40 @@ def resolve_value(
     return None
 
 
+# Separators a person actually types between several options in one answer.
+# Commas are deliberately absent: an option's own text is full of them
+# ("Local storage (SQLite, IndexedDB, or filesystem)"), so splitting on commas
+# tears the option apart instead of the answer.
+_MULTI_VALUE_SPLIT = re.compile(r"\s*(?:\n|;|\||\u2022)\s*")
+
+
+def _answer_selects_option(answer: str, option: str) -> bool:
+    """Does a stored answer name this option?
+
+    A multi-select answer holds several option texts at once, and matching it
+    with `==` selects nothing: every option is skipped, the `continue` below
+    reports nothing, and a required question ships blank while the report says
+    all is well. Names are matched outright, by prefix, and -- for a single
+    unsplit answer -- by containment, which is what makes a comma-joined list
+    of options work without breaking options that contain commas themselves.
+    """
+    wanted_raw = (answer or "").strip()
+    if not wanted_raw:
+        return False
+    option_text = (option or "").strip().casefold()
+    if not option_text:
+        return False
+    for segment in _MULTI_VALUE_SPLIT.split(wanted_raw.casefold()):
+        segment = segment.strip()
+        if not segment:
+            continue
+        if segment == option_text or option_text.startswith(segment):
+            return True
+        if len(option_text) >= 8 and option_text in segment:
+            return True
+    return False
+
+
 async def fill_application_form(
     controller: BrowserController,
     *,
@@ -167,6 +220,8 @@ async def fill_application_form(
     # One report per question, so a two-option group is not counted twice and a
     # question that was never answered cannot be skipped over.
     reported_questions: set[str] = set()
+    # question -> whether any option of it was ever selected from its answer
+    group_answer_state: dict[str, dict] = {}
 
     for control in fields:
         label = (control.label or "").strip()
@@ -194,7 +249,15 @@ async def fill_application_form(
             # alone. Nothing is inferred: without a stored answer the question
             # is reported as unanswered, which is what keeps this from ever
             # claiming an option the applicant did not choose.
-            question = question_for(label, control.group_label)
+            # For a group of *named* options the question is the group, not the
+            # option: "C. I have experimented…" is an answer, and the thing it
+            # answers is the question above it. `question_for` keeps that
+            # distinction for Yes/No pairs only, so the group is preferred here
+            # explicitly, and the option text is the fallback for the sites that
+            # expose no group at all.
+            question = (control.group_label or "").strip() or (
+                question_for(label, control.group_label)
+            )
             entry = answers.resolve(
                 question, company=company, application_id=application_id
             )
@@ -208,11 +271,25 @@ async def fill_application_form(
                     label, company=company, application_id=application_id
                 )
             if entry is not None:
-                wanted = (entry.answer or "").strip().casefold()
+                wanted = (entry.answer or "").strip()
                 option = (label or "").strip().casefold()
-                affirmative = wanted in {"yes", "y", "true", "1", "是"}
-                if (affirmative or option == wanted or (wanted and option.startswith(wanted))) \
-                        and not wanted in {"no", "n", "false", "0"}:
+                affirmative = wanted.casefold() in {"yes", "y", "true", "1", "是"}
+                negative = wanted.casefold() in {"no", "n", "false", "0"}
+                matched = not negative and (
+                    affirmative or _answer_selects_option(wanted, label)
+                )
+                # Remembered per question, not per option: a radio group has
+                # three siblings that legitimately do not match, and only the
+                # group can tell "the right one was chosen" from "an answer was
+                # stored that names no option at all". The second case used to
+                # be invisible -- it left a required question blank and was
+                # reported as filled.
+                seen = group_answer_state.setdefault(
+                    question,
+                    {"matched": False, "required": control.required, "label": label},
+                )
+                if matched:
+                    seen["matched"] = True
                     resolved = ("checked", f"answer:{entry.scope}")
                 else:
                     continue  # a sibling option, or an explicit "no"
@@ -271,6 +348,18 @@ async def fill_application_form(
             filled = FieldOutcome(label=label, ref=ref, source=source,
                                   verification=outcome.verification, detail=outcome.detail)
         elif field_type in {"select", "combobox"} or control.options:
+            # LinkedIn splits a profile phone number into a country select and
+            # a national-number input.  The profile stores ``+1 858...``;
+            # select controls need the option label instead of the whole
+            # number, otherwise an already-correct selection is reported as a
+            # mismatch on every preparation pass.
+            if re.search(r"country\s*code", label, re.IGNORECASE):
+                phone_prefix = re.match(r"\s*(\+\d+)", value)
+                if phone_prefix:
+                    for option in control.options:
+                        if phone_prefix.group(1) in option:
+                            value = option
+                            break
             outcome = await controller.select_option(ref, value)
             filled = FieldOutcome(label=label, ref=ref, source=source,
                                   verification=outcome.verification, detail=outcome.detail)
@@ -284,6 +373,23 @@ async def fill_application_form(
             report.unreadable.append(label or ref)
         elif filled.verification == "mismatch":
             report.mismatched.append(filled)
+
+    for question, seen in group_answer_state.items():
+        if seen["matched"]:
+            continue
+        # The applicant answered this question, but no option on the form
+        # carries that answer. Silently skipping it is how a required
+        # multi-select shipped blank while the report claimed success, so it is
+        # reported as the unanswered question it is.
+        bucket = (
+            report.unfilled_required if seen["required"] else report.unfilled_optional
+        )
+        bucket.append(
+            f"{question} -- answer names no option on the form"
+            f" (closest: {seen['label']})"
+            if seen["label"]
+            else question
+        )
 
     # The attachment: only ever the configured resume, verified after upload.
     if resume is not None:
@@ -402,7 +508,13 @@ def choice_answer(
     if not question:
         return None, ""
 
-    entry = answers.resolve(question, company=company, application_id=application_id)
+    # A caller without an answer store is legitimate -- the profile fallbacks
+    # below do not need one -- and used to crash here rather than fall through.
+    entry = (
+        answers.resolve(question, company=company, application_id=application_id)
+        if answers is not None
+        else None
+    )
     if entry is not None:
         parsed = _as_bool(entry.answer)
         if parsed is not None:
@@ -413,6 +525,17 @@ def choice_answer(
         parsed = _as_bool(profile.get("requires_sponsorship") or "")
         if parsed is not None:
             return parsed, "profile:requires_sponsorship"
+
+    # The same reasoning for the other questions the profile already answers.
+    # "Are you willing to undergo a background check?" had no stored answer, so
+    # it came back unanswered on a form that asks it on nearly every
+    # application -- while the profile has held `background_check_ok: yes` the
+    # whole time. The field *is* his answer to this question; nothing is
+    # inferred from anything else.
+    if classify_question(question) == "background_check":
+        parsed = _as_bool(profile.get("background_check_ok") or "")
+        if parsed is not None:
+            return parsed, "profile:background_check_ok"
 
     return None, ""
 

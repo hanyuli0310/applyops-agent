@@ -371,18 +371,29 @@ anything; these are standing answers, not guesses.
 1. **Consent and agreement checkboxes: check them.** "By checking this box you
    consent to…" is agreed by default. The applicant has decided that the
    convenience of applying outweighs reading each consent line.
-2. **Experience questions are answered from the applicant's stated experience,
-   and "none of the above" is a last resort.** When a screening question offers
-   options that describe his background, pick the truthful match (or matches, on
-   multi-select) based on the profile and his past answers. If **no** option is
-   truthful, do not invent one: leave the question unanswered, name it in
-   `missing`, and ask. A screening question is checked by the employer later; a
-   false answer here is discovered at the interview.
+2. **Experience questions: never select "none of the above" — select the options
+   that match the applicant's background.** The applicant has decided that the
+   cost of leaving an experience question blank (or marking it "none") outweighs
+   the stretch of selecting a related option. For a multi-select, pick every
+   option that his background plausibly covers; for a single choice, pick the
+   closest match. His background: UCSD MSCS, Alibaba Cloud SWE intern (AI
+   agents, harness engineering, MCP, backend infrastructure).
 3. **"Where are you currently based?" and every location question takes the
    posting's location** (`applications.location`, filled as `job:location`) —
    the applicant decided that a city question is about *which* job, not about
    where he lives. Remote postings included.
-4. **Questions that are facts about him and are not covered here** — new ones,
+4. **A question is answered by what it asks, not by how it is worded.** He
+   answers each question once; a form that words it differently inherits that
+   answer through its semantic class (sponsorship, work authorization,
+   relocation, workplace mode, compensation basis, background check, criminal
+   history). "Do you need a Work VISA to work in the country where this job is
+   located?" and "Will you now or in the future require sponsorship for
+   employment visa status?" are one question with one answer. A question
+   outside those classes is still asked, never answered from a neighbour — and
+   the accumulated answers only count when the store can actually read them,
+   which is why `AnswerStore` reads the flywheel's `learned_qa` through rather
+   than keeping a second copy.
+5. **Questions that are facts about him and are not covered here** — new ones,
    or ones where the truthful answer would be "none of the above" — still go to
    the applicant. The store of answers is the place to record them once, so the
    next application does not ask again.
