@@ -54,7 +54,9 @@ export interface Application {
   state: string;
   title: string;
   company: string;
+  location?: string;
   created_at: string;
+  updated_at?: string;
   display_state?: string;
   reason_code?: string;
   reason_text?: string;
@@ -68,6 +70,7 @@ export interface Attempt {
   detail: string;
   started_at: string;
   ended_at: string;
+  evidence?: Record<string, unknown>;
 }
 
 export interface PendingRequest {
@@ -81,6 +84,12 @@ export interface PendingRequest {
   reason_code: string;
   available_actions: string[];
   summary: string;
+}
+
+export interface ApplicationEvent {
+  at: string;
+  kind: string;
+  payload?: Record<string, unknown>;
 }
 
 export interface FillOutcome {
@@ -173,7 +182,12 @@ export const api = {
       `/applications${stateFilter ? `?state_filter=${stateFilter}` : ""}`
     ),
   applicationDetail: (id: string) =>
-    request<{ application: Application; attempts: Attempt[]; events: { at: string; kind: string }[] }>(
+    request<{
+      application: Application;
+      view?: Application;
+      attempts: Attempt[];
+      events: ApplicationEvent[];
+    }>(
       `/applications/${id}`
     ),
   enqueue: (body: { job_url: string; job_id?: string; title?: string; company?: string }) =>
