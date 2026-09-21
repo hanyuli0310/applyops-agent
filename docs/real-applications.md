@@ -132,6 +132,22 @@ These used to be enforced by the test suite; the suite was removed on
 - **`careers-page.com` had its own four**: `phone` and `years of experience`
   (twice) came back `mismatch`, `Salary` was `unreadable`, and a repeated
   `full name` section was `unverifiable`.
+- **Anonymous dropzone inputs can collide with a text field's label.** Ashby
+  renders a file input whose nearest label is `Name` -- the same label as the
+  name text field above it. Choosing "the first file control" produced the
+  reference `label=Name`, which resolved to the *text* field, and
+  `set_input_files` timed out on it while a real application shipped without a
+  resume. Prefer a reference that names the control directly, and prove it
+  resolves to a control of `type=file` before using it
+  (`filling._file_input_ref`).
+- **A `[value="on"]` clause can match nothing.** Ashby's consent checkbox uses
+  the whole consent sentence (329 characters) as its `name` attribute, and its
+  value exists as a property but not as an attribute; CSS attribute selectors
+  match attributes only. The collector records whether a value *attribute* is
+  present and `build_ref` appends the clause only then
+  (`locator.py`, `valueAttribute`).
+- **Consent checkboxes are a standing answer** (AGENTS.md §14): checked by
+  default, reported with the source `default:consent (AGENTS.md §14)`.
 - **Typeahead fields.** LinkedIn's `Location (city)` is
   `role=combobox` + `aria-autocomplete=list`: a typed value alone reports
   `mismatch: control reports a different option` because a suggestion has to be
@@ -147,7 +163,16 @@ These used to be enforced by the test suite; the suite was removed on
 - **Demographic blocks.** A real Greenhouse form cannot be submitted until the
   applicant answers its required demographic survey; the product parks instead.
 
-## 7. Operating notes
+## 7. Standing applicant defaults
+
+`AGENTS.md` §14 records the decisions the applicant made once, so forms stop
+asking: consent and agreement checkboxes are checked by default; experience
+questions are answered from his stated experience, with "none of the above"
+as a last resort (and never chosen on his behalf when no option is truthful);
+every location question takes the posting's location. Anything not covered
+there still goes to the applicant.
+
+## 8. Operating notes
 
 - **Data directory.** `data/` holds the real profile (`profile.md`), resume,
   answers (`answers` store), ledger (`app.sqlite`, schema v2 with
