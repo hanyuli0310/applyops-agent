@@ -135,7 +135,7 @@ def build_server() -> MCPServer:
     server = MCPServer(
         name="applyops",
         title="ApplyOps Auto-Apply",
-        version="0.1.0",
+        version="0.2.0",
         instructions=INSTRUCTIONS,
     )
     register(server, RUNTIME)
