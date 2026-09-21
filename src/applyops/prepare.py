@@ -25,14 +25,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .apply_target import form_control_count, offsite_apply_host
+from .apply_target import follow_offsite_apply, form_control_count, host_of, offsite_apply_host
 from .browser import BrowserController
 from .company_policy import CompanyDecision, CompanyPolicyStore
 from .filling import fill_application_form, resume_for_fill
-from .platforms.naming import EXTERNAL_ROUTE, is_drivable_route
+from .memory import RouteStep
+from .platforms.naming import EXTERNAL_ROUTE, is_drivable_route, platform_for_url
 from .resume import ResumeError, ResumeRef, resolve_resume
 from .service import ApplicationService
 from .state_machine import ApplicationState
+
+#: The route label used for an application that had to leave the posting to be
+#: completed on the employer's own system. Separate from `external`, which means
+#: "we cannot drive this at all".
+EXTERNAL_ATS_ROUTE = "external_ats"
 
 
 @dataclass
@@ -43,6 +49,9 @@ class PrepareOutcome:
     missing: list[str] = field(default_factory=list)
     detail: str = ""
     fill_report: dict = field(default_factory=dict)
+    #: `<platform>/<route>` under which this journey was remembered, empty when
+    #: nothing was walked (and therefore nothing learned).
+    journey_key: str = ""
 
     @property
     def ready(self) -> bool:
@@ -71,6 +80,7 @@ async def prepare_application(
     application_id: str,
     *,
     resume: ResumeRef | None = None,
+    allow_offsite_hop: bool = False,
 ) -> PrepareOutcome:
     """Fill, verify and file the approval request for one application."""
     row = service.get(application_id)
@@ -159,6 +169,10 @@ async def prepare_application(
     # `easy_apply` by `resolve_route`; here is where that gets corrected, before
     # anything is filled and before any request is filed on the wrong basis.
     offsite_host = await offsite_apply_host(controller)
+    if offsite_host and allow_offsite_hop:
+        return await _walk_the_hop(
+            service, controller, application_id, resume, offsite_host
+        )
     if offsite_host:
         service.set_route(application_id, EXTERNAL_ROUTE)
         detail = (
@@ -201,6 +215,34 @@ async def prepare_application(
             detail=detail,
         )
 
+    return await _fill_and_file(
+        service,
+        controller,
+        application_id,
+        row,
+        route,
+        resume,
+        steps=[RouteStep(ordinal=1, kind="open", detail=row.job_url)],
+    )
+
+
+async def _fill_and_file(
+    service: ApplicationService,
+    controller: BrowserController,
+    application_id: str,
+    row,
+    route: str,
+    resume: ResumeRef,
+    steps: list[RouteStep],
+) -> PrepareOutcome:
+    """Fill the form in front of us, verify it, and file the approval request.
+
+    Shared by the direct path and the two-hop path so that the *ordering* rule
+    holds in both: the request is created on the page the form is actually on,
+    which is what binds the later submission to the right screen.
+    """
+    steps.append(RouteStep(ordinal=len(steps) + 1, kind="fill", detail="the form in front of us"))
+
     report = await fill_application_form(
         controller,
         memory=service.memory,
@@ -209,6 +251,26 @@ async def prepare_application(
         application_id=application_id,
         company=row.company,
     )
+
+    filled_steps = [
+        RouteStep(
+            ordinal=0,
+            kind="fill",
+            detail=f"{outcome.label} <- {outcome.source}",
+            selector=outcome.ref,
+        )
+        for outcome in report.filled
+    ]
+    if report.resume is not None:
+        filled_steps.append(
+            RouteStep(
+                ordinal=0,
+                kind="upload",
+                detail=f"resume <- {report.resume.source}",
+                selector=report.resume.ref,
+            )
+        )
+
     if not report.ready:
         missing = (
             report.unfilled_required
@@ -216,6 +278,7 @@ async def prepare_application(
             or [m.label for m in report.mismatched]
             or report.problems
         )
+        _remember_blockage(service, row, route, f"fill: {', '.join(missing) or 'incomplete'}")
         service.prepare(
             application_id,
             ready=False,
@@ -252,12 +315,152 @@ async def prepare_application(
         detail=f"request {request.request_id} filed for approval",
         payload={"route": route},
     )
+
+    # Remember the path that worked, so the next application of this kind does
+    # not need a person to walk it again.
+    journey_key = _remember_journey(service, row, route, steps + filled_steps, report)
+
     return PrepareOutcome(
         state=ApplicationState.WAITING_FOR_APPROVAL.value,
         route=route,
         request_id=request.request_id,
         fill_report=report.to_dict(),
+        journey_key=journey_key,
     )
+
+
+async def _walk_the_hop(
+    service: ApplicationService,
+    controller: BrowserController,
+    application_id: str,
+    resume: ResumeRef | None,
+    offsite_host: str,
+) -> PrepareOutcome:
+    """Follow the Apply control to the employer's own site, and work there.
+
+    This is the two-hop path: the posting is only a signpost, and the application
+    lives somewhere else. Every step taken here is recorded, because the whole
+    point of walking it once is that the next one can be automated.
+    """
+    row = service.get(application_id)
+    assert row is not None
+    started_at = controller.page.url
+    landing_url, clicked = await follow_offsite_apply(controller)
+    if not landing_url:
+        detail = (
+            f"the Apply control points at {offsite_host} but could not be followed; "
+            "open the posting and finish the application there"
+        )
+        _remember_blockage(service, row, EXTERNAL_ATS_ROUTE, f"hop: {offsite_host}")
+        service.prepare(
+            application_id, ready=False, detail=detail, payload={"missing": ["off-site hop"]}
+        )
+        return PrepareOutcome(
+            state=ApplicationState.WAITING_FOR_INPUT.value,
+            route=EXTERNAL_ROUTE,
+            missing=[f"off-site application on {offsite_host}"],
+            detail=detail,
+        )
+
+    landing_host = host_of(landing_url)
+    route = EXTERNAL_ATS_ROUTE
+    service.set_route(application_id, route)
+    steps = [
+        RouteStep(ordinal=1, kind="open", detail=started_at),
+        RouteStep(ordinal=2, kind="click", detail=clicked or "Apply"),
+        RouteStep(ordinal=3, kind="hop", detail=f"{offsite_host} -> {landing_url}"),
+    ]
+
+    if resume is None:
+        try:
+            resume = resolve_resume(
+                service.memory.profile.value("resume_path") if service.memory else None
+            )
+        except ResumeError as exc:
+            service.prepare(
+                application_id,
+                ready=False,
+                detail=f"needs input before it can be submitted: resume ({exc})",
+                payload={"missing": ["resume"]},
+            )
+            return PrepareOutcome(
+                state=ApplicationState.WAITING_FOR_INPUT.value,
+                route=route,
+                missing=["resume"],
+                detail=str(exc),
+            )
+
+    if await form_control_count(controller) == 0:
+        detail = (
+            f"followed the Apply control to {landing_host}, but there is no application "
+            "form there yet -- it may need a login first"
+        )
+        _remember_blockage(service, row, route, f"hop landing: {landing_host}")
+        service.prepare(
+            application_id,
+            ready=False,
+            detail=detail,
+            payload={"missing": ["no application form at the landing page"]},
+        )
+        return PrepareOutcome(
+            state=ApplicationState.WAITING_FOR_INPUT.value,
+            route=route,
+            missing=["no application form at the landing page"],
+            detail=detail,
+        )
+
+    outcome = await _fill_and_file(
+        service, controller, application_id, row, route, resume, steps
+    )
+    outcome.journey_key = outcome.journey_key or ""
+    return outcome
+
+
+def _journey_key(row, route: str) -> tuple[str, str]:
+    """Where a journey of this kind is filed: (`Generic` when the host is unknown).
+
+    `Generic` mirrors the convention the flywheel already uses for platform
+    buckets, so route knowledge and selector knowledge land in the same place.
+    """
+    platform = platform_for_url(row.job_url)
+    if platform in {"", "Unknown"}:
+        platform = "Generic"
+    return platform, route
+
+
+def _remember_journey(
+    service: ApplicationService, row, route: str, steps: list[RouteStep], report
+) -> str:
+    """Write the path that worked, and return the key it was filed under."""
+    if service.memory is None:
+        return ""
+    platform, route_name = _journey_key(row, route)
+    ordered = [
+        RouteStep(ordinal=index + 1, kind=s.kind, detail=s.detail, selector=s.selector)
+        for index, s in enumerate(steps)
+        if s.kind != "fill" or s.detail != "the form in front of us"
+    ]
+    signature = [
+        f"apply:{row.platform or 'unknown'}",
+        f"route:{route_name}",
+        f"fields:{len(report.filled)}",
+    ]
+    service.memory.record_journey(
+        platform,
+        route_name,
+        ordered,
+        entry_signature=signature,
+        notes=f"walked for {row.job_url}",
+    )
+    return f"{platform}/{route_name}"
+
+
+def _remember_blockage(service: ApplicationService, row, route: str, where: str) -> None:
+    """The other half of the flywheel: where this path died, and why."""
+    if service.memory is None:
+        return
+    platform, route_name = _journey_key(row, route)
+    service.memory.record_route_blockage(platform, route_name, where)
 
 
 def resume_for(service: ApplicationService) -> ResumeRef | None:

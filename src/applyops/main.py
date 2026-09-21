@@ -22,11 +22,11 @@ import json
 import os
 import shutil
 import signal
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import concurrency
 from .concurrency import browser_lock_path, is_free
 from .mcp.runtime import DATA_DIR_ENV, default_data_dir
 
@@ -250,45 +250,6 @@ def _console_is_ours(port: int) -> bool:
     return isinstance(body, dict) and "profile_ready" in body and "version" in body
 
 
-def _list_processes() -> str:
-    """`ps` output, as text -- injectable so the parsing can be tested."""
-    try:
-        return subprocess.run(
-            ["ps", "-Ao", "pid=,command="],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
-
-
-def browsers_on_profile(root: Path) -> list[int]:
-    """Pids of Chrome instances holding this data directory open.
-
-    The attach helper starts Chrome *detached* on purpose, so it outlives its
-    launcher. When a run dies, the flock goes with it and `doctor` reports the
-    browser lock free while a Chrome is very much alive on the profile -- and
-    every later run then fails with Chromium's "profile is already in use".
-    Finding it by its command line is the only handle left, because there is no
-    pid file for a browser nobody recorded.
-    """
-    profile = str((root / "browser-profile").resolve())
-    pids: list[int] = []
-    for line in _list_processes().splitlines():
-        stripped = line.strip()
-        if not stripped or "Chrome" not in stripped:
-            continue
-        head, _, command = stripped.partition(" ")
-        if f"--user-data-dir={profile}" not in command.replace("\n", ""):
-            continue
-        if not head.isdigit():
-            continue
-        pids.append(int(head))
-    return pids
-
-
 def stop(data_dir: Path | None = None) -> int:
     root = data_dir or default_data_dir()
     record = _read_run_file(root)
@@ -296,7 +257,7 @@ def stop(data_dir: Path | None = None) -> int:
         # Unparseable or empty: nothing can be proven from it, and leaving it
         # behind would make the next `stop` print the same thing forever.
         _pid_file(root).unlink(missing_ok=True)
-        stragglers = browsers_on_profile(root)
+        stragglers = concurrency.browsers_on_profile(root / 'browser-profile')
         for pid in stragglers:
             try:
                 os.kill(pid, signal.SIGTERM)

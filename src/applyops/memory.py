@@ -1408,6 +1408,36 @@ class MemoryStore:
     def list_routes(self) -> list[str]:
         return sorted(self._data.routes.keys())
 
+    def record_journey(
+        self,
+        platform: str,
+        route: str,
+        steps: list[RouteStep],
+        *,
+        entry_signature: list[str] | None = None,
+        notes: str = "",
+    ) -> RouteKnowledge:
+        """Remember how an application of this kind was actually walked.
+
+        `RouteStep`'s own docstring used to say these steps were "not to replay a
+        recording" -- they described the shape of a journey, not the journey. This
+        writes the journey: the order the screens came in, the control each step
+        used, what was typed into each field and where the value came from.
+
+        Stored whole rather than appended: a journey is a path, and a path that
+        has half of yesterday's steps in it is worse than no path at all. Every
+        successful walk overwrites the previous recording, so what the next run
+        replays is what worked last time.
+        """
+        record = self.get_route(platform, route)
+        record.steps = list(steps)
+        if entry_signature is not None:
+            record.entry_signature = list(entry_signature)
+        if notes:
+            record.notes = notes
+        self._save()
+        return record
+
     def record_route_blockage(
         self, platform: str, route: str, step: str, notes: str = ""
     ) -> RouteKnowledge:

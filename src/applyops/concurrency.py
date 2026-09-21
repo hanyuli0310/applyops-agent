@@ -67,6 +67,50 @@ except ImportError:  # pragma: no cover - import-time platform check
 # fd *number*, not a secret: see `_inherited_fd` for why that is safe.
 LOCK_FD_ENV = "APPLYOPS_LOCK_FD"
 
+
+def _list_processes() -> str:
+    """`ps` output, as text. Injectable so the parsing is testable."""
+    import subprocess
+
+    try:
+        return subprocess.run(
+            ["ps", "-Ao", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def browsers_on_profile(profile: str | Path) -> list[int]:
+    """Pids of Chrome instances holding this data directory open.
+
+    The attach helper starts Chrome *detached* on purpose, so it outlives its
+    launcher: when a run dies, the flock goes with it and `doctor` reports the
+    browser lock free while a Chrome is very much alive on the profile. Finding
+    it by its command line is the only handle left -- and it is also what makes
+    "is the browser on port 9222 *mine*?" answerable, which matters because two
+    data directories can each have a browser up at the same time.
+    """
+    given = Path(profile)
+    # Both spellings: the launcher's (`/var/folders/...`) and the resolved one
+    # (`/private/var/folders/...`) are the same directory on macOS, and Chrome
+    # keeps whichever it was handed.
+    spellings = {str(given), str(given.resolve())}
+    pids: list[int] = []
+    for line in _list_processes().splitlines():
+        stripped = line.strip()
+        if not stripped or "Chrome" not in stripped:
+            continue
+        head, _, command = stripped.partition(" ")
+        if not head.isdigit():
+            continue
+        if any(f"--user-data-dir={spelling}" in command for spelling in spellings):
+            pids.append(int(head))
+    return pids
+
 # How long a caller waits for a lock it has no business failing on -- a data
 # file, written in milliseconds. The browser lock is taken differently: it is
 # either free (start) or someone else is driving (refuse).

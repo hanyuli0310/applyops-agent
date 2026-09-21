@@ -18,6 +18,7 @@ application, or point somewhere else that does?
 
 from __future__ import annotations
 
+import asyncio
 from urllib.parse import parse_qs, urlparse
 
 from .browser import BrowserController
@@ -116,3 +117,44 @@ async def form_control_count(controller: BrowserController) -> int:
         )
     except Exception:  # noqa: BLE001 - an unreadable page is not an empty one
         return 1
+
+
+async def follow_offsite_apply(controller: BrowserController) -> tuple[str, str]:
+    """Click the off-site apply control and return (landing url, clicked label).
+
+    Deliberately narrow: it clicks only a control that *leaves this site*, matched
+    the same way `offsite_apply_host` matches. A button called "Submit
+    application" is never this, and a link that stays on this host is not this
+    either -- so this cannot walk past the end of an application.
+    """
+    current_host = host_of(controller.page.url)
+    controls = await controller.page.evaluate(_COLLECT_APPLY_JS)
+    for control in controls or []:
+        label = str(control.get("text", ""))
+        if not _looks_like_apply(label):
+            continue
+        href = str(control.get("href") or "")
+        destination = host_of(unwrap(href))
+        if not destination or destination == current_host:
+            continue
+
+        pages_before = list(controller.context.pages)
+        element = await _element_for(controller, label, href)
+        if element is None:
+            continue
+        await element.click(timeout=15000, no_wait_after=True)
+        await controller._adopt_new_tabs(pages_before)
+        await asyncio.sleep(0.6)
+        return controller.page.url, label
+    return "", ""
+
+
+async def _element_for(controller: BrowserController, label: str, href: str):
+    """The clickable element for a control we found by reading the page."""
+    from .locator import find_button, resolve_ref
+
+    if href:
+        element = await resolve_ref(controller.page, f"css=a[href=\"{href}\"]")
+        if element is not None:
+            return element
+    return await find_button(controller.page, label)

@@ -184,7 +184,7 @@ def validate_choices(fields: dict[str, str], files: dict[str, str]) -> list[str]
     return problems
 
 
-def _offsite_posting(ats_host: str) -> str:
+def _offsite_posting(ats_host: str, local_target: str = "") -> str:
     """A posting that is NOT Easy Apply: the apply control leaves for another site.
 
     Shaped after the real thing, down to the redirect wrapper LinkedIn uses --
@@ -192,8 +192,13 @@ def _offsite_posting(ats_host: str) -> str:
     -- because that wrapper is the only signal on the page that says "the
     application is not here".
     """
-    target = "https://boards.greenhouse.io/acme/jobs/7742875"
-    wrapped = f"https://www.linkedin.com/safety/go/?url={quote(target, safe='')}"
+    if local_target:
+        # Same redirect *shape* as LinkedIn's, on our own host -- a fixture that
+        # pointed at the real linkedin.com would click out to the internet.
+        wrapped = local_target
+    else:
+        target = "https://boards.greenhouse.io/acme/jobs/7742875"
+        wrapped = f"https://www.linkedin.com/safety/go/?url={quote(target, safe='')}"
     return _page(
         "Backend Engineer — Acme",
         "<div class='banner'>Local demo posting. The application lives on another "
@@ -328,8 +333,28 @@ class DemoATS:
                 if parsed.path == "/choices":
                     self._write(200, _choices_form())
                     return
+                if parsed.path == "/-/go":
+                    target = (parse_qs(parsed.query).get("url") or [""])[0]
+                    if target.startswith(("http://", "https://")):
+                        self.send_response(302)
+                        self.send_header("Location", target)
+                        self.end_headers()
+                        return
+                    self._write(400, _page("Bad redirect", "<p>missing url</p>"))
+                    return
+
                 if parsed.path == "/offsite":
-                    self._write(200, _offsite_posting(self.headers.get("Host", "")))
+                    # `?landing=1` points the Apply control at this same server
+                    # under the other loopback hostname, so the whole two-hop
+                    # flow (posting -> employer ATS) can be driven locally.
+                    port = outer._server.server_address[1] if outer._server else 0
+                    local = ""
+                    if parse_qs(parsed.query).get("landing"):
+                        form = f"http://localhost:{port}/form"
+                        # Wrap it the way LinkedIn wraps an outbound apply link,
+                        # but through this server: `/-/go?url=<target>`.
+                        local = f"http://localhost:{port}/-/go?url={quote(form, safe='')}"
+                    self._write(200, _offsite_posting(self.headers.get("Host", ""), local))
                     return
                 if parsed.path == "/-/last-submission":
                     payload = json.dumps(outer.last_submission, ensure_ascii=False).encode(

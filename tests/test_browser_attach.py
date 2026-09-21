@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-from applyops.browser import BrowserController
+from applyops.browser import BrowserController, profile_debug_port
 from applyops.demo_ats import DemoATS
 
 CHROME_BIN = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -47,14 +47,20 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _launch_detached(profile: Path, port: int) -> subprocess.Popen:
-    """A stand-in for what `tools/attach.py` leaves behind."""
+def _launch_detached(profile: Path, port: int | None) -> subprocess.Popen:
+    """A stand-in for what `tools/attach.py` leaves behind.
+
+    `port=None` starts a Chrome that holds the profile but offers no debugging
+    endpoint at all -- the "someone has the profile open in a normal window" case.
+    """
     profile.mkdir(parents=True, exist_ok=True)
-    return subprocess.Popen(
-        [
-            CHROME_BIN,
-            f"--user-data-dir={profile}",
-            f"--remote-debugging-port={port}",
+    args = [
+        CHROME_BIN,
+        f"--user-data-dir={profile}",
+    ]
+    if port is not None:
+        args.append(f"--remote-debugging-port={port}")
+    args += [
             "--no-first-run",
             "--no-default-browser-check",
             "--no-sandbox",
@@ -62,7 +68,9 @@ def _launch_detached(profile: Path, port: int) -> subprocess.Popen:
             "--disable-gpu",
             "--disable-dev-shm-usage",
             "about:blank",
-        ],
+        ]
+    return subprocess.Popen(
+        args,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -90,12 +98,20 @@ async def test_the_controller_uses_a_browser_that_is_already_up(chrome_available
     """The repro, inverted: an abandoned browser must be reusable, not fatal."""
     root = _tmp()
     profile = root / "browser-profile"
-    port = _free_port()
-    proc = _launch_detached(profile, port)
+    proc = _launch_detached(profile, port=0)  # Chrome picks, and records it
     try:
+        for _ in range(30):
+            if profile_debug_port(profile):
+                break
+            await asyncio.sleep(0.5)
+        port = profile_debug_port(profile)
+        assert port, "the detached browser recorded no debugging port"
         assert await _wait_for_port(port), "the detached browser never answered"
 
-        controller = BrowserController(headless=False, user_data_dir=profile, debug_port=port)
+        # No port passed: the controller must find the browser from the profile
+        # itself (`DevToolsActivePort`), which is the only way to be sure the
+        # browser it attaches to is *this* profile's.
+        controller = BrowserController(headless=False, user_data_dir=profile)
         await controller.launch()
         assert controller.attached is True
 
@@ -119,14 +135,13 @@ async def test_an_unattachable_profile_fails_with_an_actionable_message(chrome_a
     """When we must launch but the profile is taken, say what to do about it."""
     root = _tmp()
     profile = root / "browser-profile"
-    port = _free_port()
-    proc = _launch_detached(profile, port)
+    proc = _launch_detached(profile, port=None)
     try:
-        assert await _wait_for_port(port), "the detached browser never answered"
+        await asyncio.sleep(3)  # let Chrome take the profile
 
-        # A controller that has *not* been told about the port: it will try to
-        # launch and the profile will be busy -- exactly the reported failure.
-        controller = BrowserController(headless=False, user_data_dir=profile, debug_port=_free_port())
+        # The profile is held by a browser that offers no way in: launching must
+        # fail with something a human can act on, not Chromium's own sentence.
+        controller = BrowserController(headless=False, user_data_dir=profile)
         with pytest.raises(RuntimeError) as excinfo:
             await controller.launch()
 
@@ -148,6 +163,7 @@ def test_stop_cleans_a_browser_left_on_the_profile(monkeypatch):
     the profile busy, so the next run failed again and the user had no way out.
     """
 
+    from applyops import concurrency as concurrency_module
     from applyops import main as main_module
 
     root = _tmp()
@@ -160,12 +176,12 @@ def test_stop_cleans_a_browser_left_on_the_profile(monkeypatch):
     try:
         fake_ps = (
             f"{victim.pid} /Applications/Google Chrome.app/Contents/MacOS/Google Chrome "
-            f"--user-data-dir={profile.resolve()} --remote-debugging-port=9222 about:blank\n"
+            f"--user-data-dir={profile} --remote-debugging-port=9222 about:blank\n"
             "4242 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome "
             "--user-data-dir=/Users/someone/else --remote-debugging-port=9222\n"
             "4243 /usr/bin/python3 -c pass\n"
         )
-        monkeypatch.setattr(main_module, "_list_processes", lambda: fake_ps)
+        monkeypatch.setattr(concurrency_module, "_list_processes", lambda: fake_ps)
 
         assert main_module.stop(root) == 0
 

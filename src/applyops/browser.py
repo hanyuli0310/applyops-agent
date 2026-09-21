@@ -207,6 +207,25 @@ class PageState(BaseModel):
 #: free lock file.
 DEFAULT_DEBUG_PORT = 9222
 
+
+#: Chrome writes this file into the profile directory when it is started with
+#: remote debugging. It names the port and the browser path -- so it answers "is
+#: a browser already up *on this profile*, and where do I talk to it?" without
+#: guessing at ports or scanning the process table (which is not even permitted
+#: in every environment this runs in).
+DEVTOOLS_PORT_FILE = "DevToolsActivePort"
+
+
+def profile_debug_port(profile: Path) -> int:
+    """The debugging port a browser on this profile is listening on, or 0."""
+    try:
+        first_line = (profile / DEVTOOLS_PORT_FILE).read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()[0]
+        return int(first_line.strip())
+    except (OSError, IndexError, ValueError):
+        return 0
+
 _ALREADY_IN_USE = "already in use"
 
 
@@ -259,7 +278,22 @@ class BrowserController:
         self._user_data_dir.mkdir(parents=True, exist_ok=True)
         self._playwright = await async_playwright().start()
 
-        if await asyncio.to_thread(self.endpoint_up, self.debug_port):
+        # Attach only to a browser that is on *this* profile. The port comes from
+        # the profile's own `DevToolsActivePort` file, so another data directory's
+        # browser cannot be hijacked by us sharing a port number with it.
+        existing_port = await asyncio.to_thread(profile_debug_port, self._user_data_dir)
+        # The one exception, and it is a convention rather than a guess:
+        # `tools/attach.py` starts the *project's* browser with a fixed port. No
+        # other profile inherits that, so a temporary one can never attach to a
+        # stranger's browser by accident.
+        if (
+            not existing_port
+            and self._is_project_profile()
+            and await asyncio.to_thread(self.endpoint_up, self.debug_port)
+        ):
+            existing_port = self.debug_port
+        if existing_port and await asyncio.to_thread(self.endpoint_up, existing_port):
+            self.debug_port = existing_port
             await self._attach()
             return
 
@@ -273,7 +307,11 @@ class BrowserController:
                     "--disable-blink-features=AutomationControlled",
                     "--no-first-run",
                     "--no-default-browser-check",
-                    f"--remote-debugging-port={self.debug_port}",
+                    # Let Chrome choose, so it records the choice in the
+                    # profile's own `DevToolsActivePort`: a browser we started
+                    # stays attachable, and no fixed port of ours can be
+                    # inherited by a different data directory.
+                    "--remote-debugging-port=0",
                     # Mirrors the attach helper: without the mock keychain pair
                     # Chrome cannot decrypt this profile's cookies and deletes
                     # them, which logs the user out of everything.
@@ -326,6 +364,16 @@ class BrowserController:
     def attached(self) -> bool:
         """True when we connected to a browser we did not start."""
         return self._attached
+
+    def _is_project_profile(self) -> bool:
+        """Whether this profile is the project's own (`data/browser-profile`)."""
+        project_profile = (
+            Path(__file__).resolve().parent.parent.parent / "data" / "browser-profile"
+        )
+        try:
+            return self._user_data_dir.resolve() == project_profile.resolve()
+        except OSError:
+            return False
 
     async def close(self):
         """Disconnect, and shut the browser down only if we started it."""
