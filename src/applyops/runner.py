@@ -55,6 +55,9 @@ class AutoPolicy:
     enabled: bool = False
     max_applications: int = 0
     allowed_platforms: tuple[str, ...] = ()
+    #: Whether a pass may follow an apply control to the employer's own site.
+    #: Off by default: it is a decision per installation, not a convenience.
+    allow_offsite_hop: bool = False
     expires_at_epoch: float = 0.0
     updated_at: str = ""
     updated_by: str = ""
@@ -371,7 +374,11 @@ class QueueRunner:
         reports as a parked application.
         """
         outcome = await prepare_application(
-            self.service, controller, application_id, resume=self._resume()
+            self.service,
+            controller,
+            application_id,
+            resume=self._resume(),
+            allow_offsite_hop=self.policy_store.get().allow_offsite_hop,
         )
         if outcome.ready:
             return {

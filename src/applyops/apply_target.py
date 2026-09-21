@@ -270,3 +270,34 @@ async def has_apply_control(controller: BrowserController) -> bool:
         and not looks_final_by_name(str(c.get("text", "")))
         for c in controls or []
     )
+
+
+#: Words a site uses when it wants a person to sign in before the form.
+_SIGN_IN_WORDS = ("sign in", "sign-in", "log in", "login", "create an account")
+
+
+async def sign_in_wall(controller: BrowserController) -> str:
+    """The sign-in prompt this page is showing, or "".
+
+    Some employer systems put an account between the posting and the form. That
+    is not an empty form to keep poking at -- the password field and the wording
+    are right there, and a person has to do this part.
+    """
+    try:
+        found = await controller.page.evaluate(
+            """() => {
+              const hasPassword = !!document.querySelector('input[type=password]');
+              const text = (document.body ? document.body.innerText : '').toLowerCase();
+              return { hasPassword, text: text.slice(0, 4000) };
+            }"""
+        )
+    except Exception:  # noqa: BLE001 - an unreadable page claims nothing
+        return ""
+    if not isinstance(found, dict):
+        return ""
+    words = next(
+        (word for word in _SIGN_IN_WORDS if word in str(found.get("text", ""))), ""
+    )
+    if found.get("hasPassword") and words:
+        return words
+    return ""

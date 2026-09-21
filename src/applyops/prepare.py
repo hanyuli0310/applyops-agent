@@ -32,6 +32,7 @@ from .apply_target import (
     host_of,
     offsite_apply_host,
     open_onsite_application,
+    sign_in_wall,
 )
 from .browser import BrowserController
 from .company_policy import CompanyDecision, CompanyPolicyStore
@@ -124,7 +125,13 @@ async def prepare_application(
         raise PrepareRefused(f"application is in {row.state}, which is not preparable")
 
     route = row.route or ""
-    if not is_drivable_route(route):
+    # `external` means "no verified path" -- which is exactly the posting the
+    # caller is asking us to walk when they set the hop. Without this, one
+    # default prepare records `external` and the posting can never be walked
+    # afterwards: the recorded route disqualifies the retry.
+    if allow_offsite_hop and route == EXTERNAL_ROUTE:
+        route = row.route or ""
+    elif not is_drivable_route(route):
         missing = [f"route:{route}"]
         service.prepare(
             application_id,
@@ -426,6 +433,29 @@ async def _walk_the_hop(
                 missing=["resume"],
                 detail=str(exc),
             )
+
+    wall = await sign_in_wall(controller)
+    if wall:
+        # A person has to do this part. Said in those words, with the host, so
+        # the next step is obvious and nothing here keeps poking at a login.
+        detail = (
+            f"{landing_host} wants you to sign in before it will show the application "
+            f"(it is asking to \u201c{wall}\u201d). Sign in once in this browser, then retry: "
+            "the walk can continue from there."
+        )
+        _remember_blockage(service, row, route, f"sign-in wall: {landing_host}")
+        service.prepare(
+            application_id,
+            ready=False,
+            detail=detail,
+            payload={"missing": [f"sign in to {landing_host}"]},
+        )
+        return PrepareOutcome(
+            state=ApplicationState.WAITING_FOR_INPUT.value,
+            route=route,
+            missing=[f"sign in to {landing_host}"],
+            detail=detail,
+        )
 
     if await form_control_count(controller) == 0:
         detail = (

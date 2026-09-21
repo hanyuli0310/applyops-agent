@@ -112,6 +112,17 @@ class PolicyBody(BaseModel):
     ttl_minutes: int = 60
 
 
+class PrepareBody(BaseModel):
+    """Options for preparing an application.
+
+    `allow_offsite_hop` is off by default: following an apply control to the
+    employer's own site is a decision about *this* posting, and a default that
+    did it silently would be a default that walks into other people's systems.
+    """
+
+    allow_offsite_hop: bool = False
+
+
 class PassBody(BaseModel):
     """How many this pass may send.
 
@@ -426,7 +437,7 @@ def create_app(
     # ── the run flow: prepare -> approve -> submit ───────────────────
 
     @app.post("/api/applications/{application_id}/prepare")
-    async def prepare(application_id: str) -> dict:
+    async def prepare(application_id: str, body: PrepareBody | None = None) -> dict:
         """Open the posting, fill it, and file the approval request.
 
         The work lives in `applyops.prepare` so that MCP, the console and the
@@ -445,7 +456,10 @@ def create_app(
             browser = await state.get_browser()
             try:
                 outcome = await prepare_application_impl(
-                    state.service, browser, application_id
+                    state.service,
+                    browser,
+                    application_id,
+                    allow_offsite_hop=bool(body and body.allow_offsite_hop),
                 )
             except PrepareRefused as exc:
                 raise HTTPException(409, str(exc)) from exc

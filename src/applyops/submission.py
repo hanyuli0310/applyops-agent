@@ -122,6 +122,16 @@ async def execute_authorized_submission(
     evidence_timeout: float = DEFAULT_EVIDENCE_TIMEOUT,
 ) -> SubmitOutcome:
     """Perform one final submit, or refuse. Authorization first, evidence after."""
+    if not action.success_patterns:
+        # No sentence is known to look for on this site, so a click here would
+        # send a real application and then be able to say only "unverified" --
+        # a submission nobody can confirm. Refusing before the click is the
+        # honest version: the route needs its confirmation wording added first.
+        raise SubmissionRefused(
+            "no confirmation wording is known for this site, so a submission could "
+            "not be verified afterwards; refusing to send one. Add this route's "
+            "success pattern first (see evidence.SUCCESS_EVIDENCE)."
+        )
     if not await controller.field_snapshot():
         # Checked before the grant is spent and before anything is looked up:
         # there is no form here, so there is nothing a click could submit. The

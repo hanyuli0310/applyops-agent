@@ -971,7 +971,9 @@ def register(server: MCPServer, runtime: Runtime) -> None:
             )
 
     @server.tool()
-    async def prepare_application(application_id: str) -> str:
+    async def prepare_application(
+        application_id: str, allow_offsite_hop: bool = False
+    ) -> str:
         """Fill an application's form, verify it, and file the approval request.
 
         This is the step between `enqueue_application` and
@@ -992,7 +994,10 @@ def register(server: MCPServer, runtime: Runtime) -> None:
             browser = await runtime.get_browser()
             try:
                 outcome = await prepare_application_impl(
-                    runtime.service, browser, application_id
+                    runtime.service,
+                    browser,
+                    application_id,
+                    allow_offsite_hop=allow_offsite_hop,
                 )
             except KeyError:
                 return _json({"error": f"unknown application {application_id}"})

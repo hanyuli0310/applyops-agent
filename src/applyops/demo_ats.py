@@ -220,6 +220,26 @@ def _offsite_posting(ats_host: str, local_target: str = "", decoy: bool = False)
     )
 
 
+def _login_wall() -> str:
+    """The landing page many employer ATSs show before the form: sign in first.
+
+    A password field and a sign-in button, and no application form -- which is
+    the shape a walk must recognise as "a person has to do this part", not as an
+    empty form to keep poking at.
+    """
+    return _page(
+        "Sign in — Demo ATS",
+        "<h1>Sign in to apply</h1>"
+        "<p>Create an account or sign in to continue your application.</p>"
+        "<form method='post' action='/-/login'>"
+        "<label for='email'>Email</label><input id='email' name='email' type='email'>"
+        "<label for='password'>Password</label>"
+        "<input id='password' name='password' type='password' required>"
+        "<button type='submit'>Sign in</button>"
+        "</form>",
+    )
+
+
 def _onsite_posting() -> str:
     """A posting whose Easy Apply control is a link to this site's own apply page.
 
@@ -369,6 +389,9 @@ class DemoATS:
                     self._write(400, _page("Bad redirect", "<p>missing url</p>"))
                     return
 
+                if parsed.path == "/-/login":
+                    self._write(200, _login_wall())
+                    return
                 if parsed.path == "/onsite":
                     self._write(200, _onsite_posting())
                     return
@@ -400,7 +423,8 @@ class DemoATS:
                     decoy = bool(parse_qs(parsed.query).get("decoy"))
                     local = ""
                     if parse_qs(parsed.query).get("landing"):
-                        form = f"http://localhost:{port}/form"
+                        path = "/-/login" if parse_qs(parsed.query).get("wall") else "/form"
+                        form = f"http://localhost:{port}{path}"
                         # Wrap it the way LinkedIn wraps an outbound apply link,
                         # but through this server: `/-/go?url=<target>`.
                         local = f"http://localhost:{port}/-/go?url={quote(form, safe='')}"
