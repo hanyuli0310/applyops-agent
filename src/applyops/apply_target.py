@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 from urllib.parse import parse_qs, urljoin, urlparse
 
+from .action_policy import looks_final_by_name
 from .browser import BrowserController
 
 #: Query parameters sites use to wrap an outbound link. `url` is LinkedIn's
@@ -71,6 +72,27 @@ def unwrap(href: str) -> str:
     return href
 
 
+#: Hosts that belong to the site we are standing on, not to the employer.
+_SITE_HOSTS = ("linkedin.com",)
+
+
+def is_employer_destination(destination: str, current_host: str) -> bool:
+    """Whether this destination leads to the employer, rather than deeper in.
+
+    Deliberately not "any host but ours". LinkedIn's footer is full of links to
+    `business.linkedin.com`, `safety.linkedin.com` and friends, and they appear
+    *before* the posting's apply control in the DOM. Verified live: the detection
+    step found the employer at `yoailabs.careers-page.com`, the follow step
+    picked the earlier footer link instead, and the walk stayed on LinkedIn with
+    the two halves of the same decision disagreeing.
+    """
+    host = host_of(destination)
+    if not host or host == (current_host or "").lower():
+        return False
+    bare = host.removeprefix("www.")
+    return not any(bare == site or bare.endswith(f".{site}") for site in _SITE_HOSTS)
+
+
 def host_of(url: str) -> str:
     try:
         return (urlparse(url).hostname or "").lower()
@@ -93,9 +115,9 @@ async def offsite_apply_host(controller: BrowserController) -> str:
         if not _looks_like_apply(str(control.get("text", ""))):
             continue
         href = str(control.get("href") or "")
-        destination = host_of(unwrap(href))
-        if destination and destination != current_host:
-            return destination
+        destination = urljoin(controller.page.url, unwrap(href)) if href else ""
+        if is_employer_destination(destination, current_host):
+            return host_of(destination)
     return ""
 
 
@@ -120,29 +142,45 @@ async def form_control_count(controller: BrowserController) -> int:
 
 
 async def follow_offsite_apply(controller: BrowserController) -> tuple[str, str]:
-    """Click the off-site apply control and return (landing url, clicked label).
+    """Go to the employer's own application, and return (landing url, label).
 
-    Deliberately narrow: it clicks only a control that *leaves this site*, matched
-    the same way `offsite_apply_host` matches. A button called "Submit
-    application" is never this, and a link that stays on this host is not this
-    either -- so this cannot walk past the end of an application.
+    Deliberately narrow: it follows only a control that leads to the *employer*
+    (`is_employer_destination`) -- never one that stays on this site, and never
+    one of the site's own footer links. A control named like a final submit is
+    skipped too, so this cannot walk past the end of an application.
+
+    It navigates to the control's `href` rather than clicking it: verified live
+    that a scripted click on LinkedIn's "Apply" does nothing at all -- no
+    navigation, no new tab, no modal -- while going to the href it names opens
+    the employer's page directly. A control with no href is still clicked, since
+    that is the only thing a real button can be driven by.
     """
     current_host = host_of(controller.page.url)
     controls = await controller.page.evaluate(_COLLECT_APPLY_JS)
     for control in controls or []:
         label = str(control.get("text", ""))
-        if not _looks_like_apply(label):
+        if not _looks_like_apply(label) or looks_final_by_name(label):
             continue
         href = str(control.get("href") or "")
-        destination = host_of(unwrap(href))
-        if not destination or destination == current_host:
+        destination = urljoin(controller.page.url, unwrap(href)) if href else ""
+        if destination and not is_employer_destination(destination, current_host):
             continue
+
+        if destination:
+            try:
+                await controller.goto(destination, settle=2.5)
+            except Exception:  # noqa: BLE001, S112 - an unreachable target is data
+                continue
+            return controller.page.url, label
 
         pages_before = list(controller.context.pages)
         element = await _element_for(controller, label, href)
         if element is None:
             continue
-        await element.click(timeout=15000, no_wait_after=True)
+        try:
+            await element.click(timeout=15000, no_wait_after=True)
+        except Exception:  # noqa: BLE001, S112 - an unclickable control is not a crash
+            continue
         await controller._adopt_new_tabs(pages_before)
         await asyncio.sleep(0.6)
         return controller.page.url, label
@@ -186,7 +224,7 @@ async def open_onsite_application(controller: BrowserController) -> tuple[str, s
         # their own: resolving them against the current page is what stops a
         # same-site link being mistaken for the off-site case and skipped.
         destination = urljoin(controller.page.url, unwrap(href)) if href else ""
-        if destination and host_of(destination) != current_host:
+        if destination and is_employer_destination(destination, current_host):
             continue  # that is the off-site case, handled by follow_offsite_apply
         if href and destination:
             # Navigate rather than click. Verified live: LinkedIn's "Easy Apply"

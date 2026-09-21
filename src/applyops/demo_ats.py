@@ -184,7 +184,7 @@ def validate_choices(fields: dict[str, str], files: dict[str, str]) -> list[str]
     return problems
 
 
-def _offsite_posting(ats_host: str, local_target: str = "") -> str:
+def _offsite_posting(ats_host: str, local_target: str = "", decoy: bool = False) -> str:
     """A posting that is NOT Easy Apply: the apply control leaves for another site.
 
     Shaped after the real thing, down to the redirect wrapper LinkedIn uses --
@@ -199,13 +199,23 @@ def _offsite_posting(ats_host: str, local_target: str = "") -> str:
     else:
         target = "https://boards.greenhouse.io/acme/jobs/7742875"
         wrapped = f"https://www.linkedin.com/safety/go/?url={quote(target, safe='')}"
+    # LinkedIn's own footer is full of "Apply"-ish links to other LinkedIn hosts,
+    # and they come *before* the posting's control in the DOM. They are not the
+    # employer, and following one is how a real walk got stuck on LinkedIn.
+    footer = (
+        "<footer><a href='https://business.linkedin.com/advertise'>Apply</a>"
+        "<a href='https://safety.linkedin.com/'>Apply with safety</a></footer>"
+        if decoy
+        else ""
+    )
     return _page(
         "Backend Engineer — Acme",
         "<div class='banner'>Local demo posting. The application lives on another "
         "site, exactly like a non-Easy-Apply LinkedIn posting.</div>"
+        f"{footer}"
         "<h1>Backend Engineer</h1>"
         "<p>Acme · Remote (US)</p>"
-        f"<a href='{wrapped}'>Apply</a>"
+        f"<a href='{wrapped}'>Easy Apply</a>"
         "<p>No application form on this page.</p>",
     )
 
@@ -387,13 +397,16 @@ class DemoATS:
                     # under the other loopback hostname, so the whole two-hop
                     # flow (posting -> employer ATS) can be driven locally.
                     port = outer._server.server_address[1] if outer._server else 0
+                    decoy = bool(parse_qs(parsed.query).get("decoy"))
                     local = ""
                     if parse_qs(parsed.query).get("landing"):
                         form = f"http://localhost:{port}/form"
                         # Wrap it the way LinkedIn wraps an outbound apply link,
                         # but through this server: `/-/go?url=<target>`.
                         local = f"http://localhost:{port}/-/go?url={quote(form, safe='')}"
-                    self._write(200, _offsite_posting(self.headers.get("Host", ""), local))
+                    self._write(
+                        200, _offsite_posting(self.headers.get("Host", ""), local, decoy)
+                    )
                     return
                 if parsed.path == "/-/last-submission":
                     payload = json.dumps(outer.last_submission, ensure_ascii=False).encode(

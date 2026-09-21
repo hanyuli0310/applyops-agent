@@ -266,3 +266,43 @@ async def test_without_a_posting_location_the_profile_answers_the_city_question(
             assert city["source"] == "profile:location", city
         finally:
             await browser.close()
+
+
+def test_a_linkedin_subdomain_is_not_the_employer():
+    """LinkedIn's own footer is full of links that leave www.linkedin.com.
+
+    Live, that is exactly what went wrong: `offsite_apply_host` (which reads the
+    page) found the employer at `yoailabs.careers-page.com`, while the follow
+    step iterated the DOM and picked an earlier `business.linkedin.com` footer
+    link -- the two disagreed, and the walk stayed on LinkedIn. An employer is a
+    host that is neither this one nor a LinkedIn subdomain.
+    """
+    from applyops.apply_target import is_employer_destination
+
+    assert is_employer_destination("https://yoailabs.careers-page.com/jobs/1", "www.linkedin.com")
+    assert not is_employer_destination("https://business.linkedin.com/advertise", "www.linkedin.com")
+    assert not is_employer_destination("https://safety.linkedin.com/", "www.linkedin.com")
+    assert not is_employer_destination("https://www.linkedin.com/jobs/view/1/", "www.linkedin.com")
+    # And a plain same-host link is never the employer either.
+    assert not is_employer_destination("http://127.0.0.1:8000/apply", "127.0.0.1")
+
+
+@pytest.mark.asyncio
+async def test_the_follow_step_skips_linkedin_footer_links():
+    """The decoy comes first in the DOM, exactly as it does in production."""
+    root = _tmp()
+    service = _service(root)
+    with DemoATS() as ats:
+        browser = BrowserController(headless=True, user_data_dir=root / "chrome")
+        await browser.launch()
+        try:
+            from applyops.demo_ats import DemoATS as _ATS  # noqa: F401 - clarity
+
+            await browser.goto(f"{ats.url}/offsite?landing=1&decoy=1", settle=0.8)
+            from applyops.apply_target import follow_offsite_apply
+
+            url, label = await follow_offsite_apply(browser)
+            assert "localhost" in url, url
+            assert label == "Easy Apply", label
+        finally:
+            await browser.close()

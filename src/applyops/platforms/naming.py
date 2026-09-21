@@ -41,6 +41,9 @@ def platform_for_url(url: str) -> str:
 DEMO_ROUTE = "demo"
 EASY_APPLY_ROUTE = "easy_apply"
 EXTERNAL_ROUTE = "external"
+#: The employer's own system, reached by following an apply control. Set on an
+#: application once the hop has been walked (see `prepare._walk_the_hop`).
+EXTERNAL_ATS_ROUTE = "external_ats"
 
 DEMO_HOSTS = ("127.0.0.1", "localhost", "[::1]", "::1")
 
@@ -72,5 +75,11 @@ def is_drivable_route(route: str) -> bool:
 
     `external` is a real answer, not a failure: the posting can be opened, read
     and prepared, and the final action belongs to a person.
+
+    `external_ats` is the employer's own system reached by following the apply
+    control -- a route we have already walked once, which is why it is drivable
+    while a plain `external` posting is not. Leaving it out made the second
+    attempt on the same application refuse with "route cannot be driven": the
+    first walk recorded the route, and the recorded route disqualified itself.
     """
-    return route in {DEMO_ROUTE, EASY_APPLY_ROUTE}
+    return route in {DEMO_ROUTE, EASY_APPLY_ROUTE, EXTERNAL_ATS_ROUTE}

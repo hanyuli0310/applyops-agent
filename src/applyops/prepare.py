@@ -37,15 +37,15 @@ from .browser import BrowserController
 from .company_policy import CompanyDecision, CompanyPolicyStore
 from .filling import fill_application_form, resume_for_fill
 from .memory import RouteStep
-from .platforms.naming import EXTERNAL_ROUTE, is_drivable_route, platform_for_url
+from .platforms.naming import (
+    EXTERNAL_ATS_ROUTE,
+    EXTERNAL_ROUTE,
+    is_drivable_route,
+    platform_for_url,
+)
 from .resume import ResumeError, ResumeRef, resolve_resume
 from .service import ApplicationService
 from .state_machine import ApplicationState
-
-#: The route label used for an application that had to leave the posting to be
-#: completed on the employer's own system. Separate from `external`, which means
-#: "we cannot drive this at all".
-EXTERNAL_ATS_ROUTE = "external_ats"
 
 
 @dataclass
