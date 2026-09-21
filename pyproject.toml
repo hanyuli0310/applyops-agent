@@ -33,8 +33,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24.0",
     "ruff>=0.8.0",
 ]
 
@@ -54,18 +52,5 @@ packages = ["src/applyops"]
 line-length = 100
 target-version = "py312"
 
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
-testpaths = ["tests"]
-markers = [
-    "browser: starts a real browser or drives a browser-backed flow",
-    "slow: takes longer than the fast development loop",
-    "integration: crosses more than one application boundary",
-    "concurrency: exercises process or page concurrency",
-]
-
-# The built console travels with the package. A user who installed ApplyOps
-# should never be told to run npm: `applyops serve` finds the build inside the
-# wheel at `applyops/web`.
 [tool.hatch.build.targets.wheel.force-include]
 "frontend/dist" = "applyops/web"
