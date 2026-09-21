@@ -48,7 +48,10 @@ LABEL_TO_PROFILE = (
     (re.compile(r"years?\s+of\s+experience|experience.*years", re.IGNORECASE), "years_experience"),
     (re.compile(r"current\s+(job\s+)?title|job\s+title", re.IGNORECASE), "current_title"),
     (re.compile(r"current\s+(company|employer)", re.IGNORECASE), "current_company"),
-    (re.compile(r"location|city", re.IGNORECASE), "location"),
+    # "Where are you currently based?" is the same question without the words
+    # location or city -- and a live Ashby form was left blank because of it,
+    # which is very likely why that submit was not accepted.
+    (re.compile(r"location|city|currently based", re.IGNORECASE), "location"),
     (re.compile(r"(expected\s+)?salary|compensation", re.IGNORECASE), "expected_salary"),
 )
 

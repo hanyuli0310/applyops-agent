@@ -215,6 +215,7 @@ class ApplicationService:
         resume: ResumeRef,
         action: FinalAction,
         route: str = "",
+        accept_unverified: bool = False,
     ) -> SubmitOutcome:
         """Run the authorized submission inside a claim, and record the truth.
 
@@ -299,6 +300,7 @@ class ApplicationService:
                 answers_revision=answers_revision,
                 profile_revision=profile_revision,
                 application_id=application_id,
+                accept_unverified=accept_unverified,
             )
 
             target = {

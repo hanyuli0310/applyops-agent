@@ -119,18 +119,26 @@ async def execute_authorized_submission(
     profile_revision: str = "",
     application_id: str = "",
     route_supported: bool = True,
+    accept_unverified: bool = False,
     evidence_timeout: float = DEFAULT_EVIDENCE_TIMEOUT,
 ) -> SubmitOutcome:
     """Perform one final submit, or refuse. Authorization first, evidence after."""
-    if not action.success_patterns:
+    if not action.success_patterns and not accept_unverified:
         # No sentence is known to look for on this site, so a click here would
         # send a real application and then be able to say only "unverified" --
         # a submission nobody can confirm. Refusing before the click is the
         # honest version: the route needs its confirmation wording added first.
+        #
+        # `accept_unverified` is the applicant's own say-so for the first
+        # application to a new system, where the wording cannot be known until
+        # one has been sent. It is off by default, it lives only on the paths a
+        # person invokes, and the outcome is recorded as UNVERIFIED -- not as a
+        # success -- so nothing is claimed that was not observed.
         raise SubmissionRefused(
             "no confirmation wording is known for this site, so a submission could "
             "not be verified afterwards; refusing to send one. Add this route's "
-            "success pattern first (see evidence.SUCCESS_EVIDENCE)."
+            "success pattern first (see evidence.SUCCESS_EVIDENCE), or submit with "
+            "accept_unverified=True and accept that the outcome is unverified."
         )
     if not await controller.field_snapshot():
         # Checked before the grant is spent and before anything is looked up:
