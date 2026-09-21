@@ -259,6 +259,7 @@ _JS_DESCRIBE = """
     required: !!el.required || attr('aria-required') === 'true',
     disabled: !!el.disabled || attr('aria-disabled') === 'true',
     options: options.slice(0, 200),
+    valueAttribute: attr('value') || '',
     checked: checked,
     automationId: attr('data-automation-id') || '',
     inShadow: root !== document,
@@ -301,8 +302,15 @@ def build_ref(info: dict) -> str:
         # the reference for the first group's "Yes" also matches the second
         # group's, so one of them was silently dropped at collection time and
         # could never be answered. name+value addresses exactly one option.
+        #
+        # The value clause is appended only when a `value` *attribute* is
+        # actually present. Ashby renders consent checkboxes whose `name` is
+        # the whole consent sentence and whose value exists as a property but
+        # not as an attribute; `[value="on"]` matches attributes only, so a
+        # reference built from the property matched nothing at all and the
+        # checkbox could never be touched.
         selector = f'[name="{_css_quote(name)}"]'
-        if value not in (None, ""):
+        if info.get("valueAttribute") and value not in (None, ""):
             selector += f'[value="{_css_quote(str(value))}"]'
         return f"css={selector}"
 

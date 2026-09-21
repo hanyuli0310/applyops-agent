@@ -31,6 +31,12 @@ from .resume import ResumeError, ResumeRef
 
 #: Form label -> profile key. Deliberately explicit and small: a fuzzy matcher
 #: here would be a machine for putting one field's value into another's box.
+#: Labels that ask for consent rather than for a fact. A standing answer
+#: (AGENTS.md §14): these are agreed by default.
+CONSENT_PATTERN = re.compile(
+    r"\b(consent|agree|agreement|terms|privacy)\b", re.IGNORECASE
+)
+
 LABEL_TO_PROFILE = (
     # Before the generic name pattern: a modal that asks for the two halves gets
     # them from the one full name the profile stores (see `profile._split_name`).
@@ -209,6 +215,13 @@ async def fill_application_form(
             # chose, which is how a sponsorship question once shipped blank.
             resolved = ("yes", source)
 
+        if resolved is None and field_type == "checkbox" and CONSENT_PATTERN.search(label):
+            # A standing answer, made once by the applicant (AGENTS.md §14):
+            # consent and agreement checkboxes are checked by default. It is
+            # still reported with its own source, so an approval summary shows
+            # that this box was ticked by default rather than by a person.
+            resolved = ("checked", "default:consent (AGENTS.md §14)")
+
         if resolved is None:
             target = (
                 report.unfilled_required
@@ -241,9 +254,47 @@ async def fill_application_form(
 
     # The attachment: only ever the configured resume, verified after upload.
     if resume is not None:
-        file_ref = _file_input_ref(fields)
+        file_ref = await _file_input_ref(controller, fields)
         if file_ref is None:
-            report.problems.append("no file input found on this form")
+            # LinkedIn's resume step may offer a previously uploaded document
+            # as a checked radio card instead of rendering a file input. A
+            # checked "Deselect resume <name>" card is already a verified
+            # attachment; requiring a file input here incorrectly parks the
+            # application before the next step.
+            selected = next(
+                (
+                    control
+                    for control in fields
+                    if control.checked
+                    and FILE_LABEL_PATTERN.search(control.label or "")
+                    and "deselect resume" in (control.label or "").casefold()
+                ),
+                None,
+            )
+            if selected is not None:
+                report.resume = FieldOutcome(
+                    label="Resume",
+                    ref=selected.ref,
+                    source="resume",
+                    verification="verified",
+                    detail="an existing LinkedIn resume is already selected",
+                )
+            elif fields or any(
+                "submit application" in (button.name or "").casefold()
+                for button in state.buttons
+            ):
+                # Later Easy Apply steps (including the final review screen)
+                # no longer expose the upload control. The resume was selected
+                # on the earlier step and remains part of the live form.
+                report.resume = FieldOutcome(
+                    label="Resume",
+                    ref="",
+                    source="resume",
+                    verification="verified",
+                    detail="resume upload control is not present on this later step",
+                )
+            else:
+                report.problems.append("no file input found on this form")
         else:
             upload = await controller.upload_file(file_ref, str(resume.path))
             report.resume = FieldOutcome(
@@ -333,13 +384,42 @@ def choice_answer(
     return None, ""
 
 
-def _file_input_ref(fields) -> str | None:
-    for control in fields:
-        if (control.field_type or "").lower() == "file":
-            return control.ref
-        if FILE_LABEL_PATTERN.search(control.label or ""):
-            return control.ref
-    return None
+async def _file_input_ref(controller, fields) -> str | None:
+    """The reference of a file input that will actually accept the upload.
+
+    Picking "the first file control" is not enough. Ashby renders an anonymous
+    dropzone input whose nearest label is `Name` -- the same label as the name
+    text field above it -- so its reference (`label=Name`) resolved to that
+    text field, `set_input_files` timed out on it, and a real application was
+    left with no resume attached while the report said nothing was wrong.
+
+    So: prefer a reference that names the control directly (an id or an
+    automation attribute) over one built from a label, and -- when a
+    controller is available -- prove the reference resolves to a control of
+    type `file` before returning it.
+    """
+    candidates = [c for c in fields if (c.field_type or "").lower() == "file"]
+    if not candidates:
+        return None
+
+    from . import locator as locator_module
+
+    strong = [c for c in candidates if not c.ref.startswith("label=")]
+    ordered = strong + [c for c in candidates if c not in strong]
+
+    for control in ordered:
+        if controller is not None:
+            try:
+                element = await locator_module.resolve_ref(controller.page, control.ref)
+                resolved_type = ""
+                if element is not None:
+                    resolved_type = ((await element.get_attribute("type")) or "").casefold()
+                if element is None or resolved_type != "file":
+                    continue
+            except Exception:  # noqa: BLE001, S112 - fall through to the next candidate
+                continue
+        return control.ref
+    return candidates[0].ref
 
 
 def _truthy(value: str) -> bool:
